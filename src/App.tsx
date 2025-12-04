@@ -11,16 +11,11 @@ import {
   XCircle, 
   Loader2, 
   Lock,
-  FileVideo,
   Database,
-  RefreshCw,
   HardDrive,
-  FileText,
   Cloud,
   Settings,
   Copy,
-  ExternalLink,
-  Code,
   Sparkles,
   Bot,
   AlertCircle,
@@ -286,7 +281,7 @@ const cozeSearch = async (
         let friendlyMsg = data.msg;
         // Detect "not published" error
         if (typeof data.msg === 'string' && (data.msg.includes('not been published') || data.msg.includes('Agent As API'))) {
-            friendlyMsg = "Bot 未发布到 'Agent as API' 渠道。\n请前往 Coze 平台 -> 发布 -> 勾选 'Agent as API' -> 点击发布。";
+            friendlyMsg = "Bot 未发布到 'Agent as API' 渠道。\n请前往 Coze 平台 → 发布 → 勾选 'Agent as API' → 点击发布。";
         }
         throw new Error(friendlyMsg);
     }
@@ -302,7 +297,7 @@ const cozeSearch = async (
 
          // Check for "No Knowledge Base" specific error in content
          if (content.includes('没有提供') && (content.includes('知识库') || content.includes('knowledge base'))) {
-             throw new Error("Coze Bot 未关联知识库。\n请前往 Coze 平台 -> 创建知识库并上传数据 -> 在 Bot 中添加该知识库 -> 重新发布。");
+             throw new Error("Coze Bot 未关联知识库。\n请前往 Coze 平台 → 创建知识库并上传数据 → 在 Bot 中添加该知识库 → 重新发布。");
          }
 
          // Try to extract JSON from markdown block ```json ... ``` or just [...]
@@ -974,10 +969,10 @@ JSON 格式示例:
                             <strong className="text-white">生成数据</strong>：使用"数据库配置"中的生成器，生成一个包含所有字幕的 JSON 文件。
                         </li>
                         <li>
-                            <strong className="text-white">创建知识库</strong>：前往 Coze 平台，左侧点击 <strong>[+] - 知识库</strong>，新建并上传这个 JSON 文件。
+                            <strong className="text-white">创建知识库</strong>：前往 Coze 平台，左侧点击 <strong>[+] → 知识库</strong>，新建并上传这个 JSON 文件。
                         </li>
                         <li>
-                            <strong className="text-white">关联 Bot</strong>：在你的 Bot 编排页面，点击中间的 <strong>[+] - 知识库</strong>，把刚才创建的库加进去。
+                            <strong className="text-white">关联 Bot</strong>：在你的 Bot 编排页面，点击中间的 <strong>[+] → 知识库</strong>，把刚才创建的库加进去。
                         </li>
                         <li>
                             <strong className="text-white">发布</strong>：最后点击右上角 <strong>发布</strong>，并勾选 <strong>Agent as API</strong>。
@@ -1319,7 +1314,7 @@ const App = () => {
                <p className="text-sm opacity-90 mt-1">
                  未加载任何视频。
                  {currentUser.role === 'admin' 
-                    ? " 请前往管理后台 > 数据库配置，配置远程 URL 或批量生成本地内容。" 
+                    ? " 请前往管理后台 → 数据库配置，配置远程 URL 或批量生成本地内容。" 
                     : " 请联系管理员上传内容。"}
                </p>
                {fetchError && <p className="text-xs text-red-300 mt-2 font-mono bg-red-900/20 p-2 rounded">{fetchError}</p>}
@@ -1542,4 +1537,5 @@ const App = () => {
   );
 };
 
-export default App
+// Export App component for Vite local development
+export default App;
