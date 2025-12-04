@@ -531,7 +531,7 @@ const AuthScreen = ({ onLogin }: { onLogin: (user: UserAccount) => void }) => {
                 onChange={e => setRememberMe(e.target.checked)}
               />
               <label htmlFor="remember_me" className="ml-2 text-sm text-slate-400">
-                记住账号密码 (自动登录)
+                记住账号密码
               </label>
             </div>
           )}
@@ -549,11 +549,6 @@ const AuthScreen = ({ onLogin }: { onLogin: (user: UserAccount) => void }) => {
             {isRegister ? '已有账号？去登录' : '没有账号？去注册'}
           </button>
         </div>
-        {!isRegister && (
-           <div className="mt-4 text-center text-xs text-slate-500">
-             <p>默认管理员: admin / admin</p>
-           </div>
-        )}
       </div>
     </div>
   );
@@ -979,10 +974,10 @@ JSON 格式示例:
                             <strong className="text-white">生成数据</strong>：使用"数据库配置"中的生成器，生成一个包含所有字幕的 JSON 文件。
                         </li>
                         <li>
-                            <strong className="text-white">创建知识库</strong>：前往 Coze 平台，左侧点击 <strong>[+] -> 知识库</strong>，新建并上传这个 JSON 文件。
+                            <strong className="text-white">创建知识库</strong>：前往 Coze 平台，左侧点击 <strong>[+] - 知识库</strong>，新建并上传这个 JSON 文件。
                         </li>
                         <li>
-                            <strong className="text-white">关联 Bot</strong>：在你的 Bot 编排页面，点击中间的 <strong>[+] -> 知识库</strong>，把刚才创建的库加进去。
+                            <strong className="text-white">关联 Bot</strong>：在你的 Bot 编排页面，点击中间的 <strong>[+] - 知识库</strong>，把刚才创建的库加进去。
                         </li>
                         <li>
                             <strong className="text-white">发布</strong>：最后点击右上角 <strong>发布</strong>，并勾选 <strong>Agent as API</strong>。
@@ -1546,3 +1541,5 @@ const App = () => {
     </div>
   );
 };
+
+export default App
