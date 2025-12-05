@@ -1,12 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
-import { createClient } from '@supabase/supabase-js';
 
 import { 
   Search, 
   Play, 
   Upload, 
-  User, 
   LogOut, 
   Shield, 
   CheckCircle, 
@@ -24,12 +22,18 @@ import {
   Download,
   Files,
   Trash2,
-  Globe,
-  Flag,
-  BookOpen,
   Check,
   Users
 } from 'lucide-react';
+
+// --- Global Types for UMD libs ---
+declare global {
+  interface Window {
+    supabase: {
+      createClient: (url: string, key: string) => any;
+    };
+  }
+}
 
 // --- Types ---
 
@@ -256,7 +260,10 @@ const SupabaseService = {
     getClient: () => {
         const settings = MockDB.getSettings();
         if (!settings.supabaseUrl || !settings.supabaseKey) return null;
-        return createClient(settings.supabaseUrl, settings.supabaseKey);
+        if (window.supabase) {
+            return window.supabase.createClient(settings.supabaseUrl, settings.supabaseKey);
+        }
+        return null;
     },
 
     // --- Video & Transcript Logic ---
@@ -943,6 +950,7 @@ const AdminPanel = ({ onClose, onDbUpdate }: { onClose: () => void, onDbUpdate: 
   };
 
   const confirmMigration = async () => {
+    if (!migrationData) return;
     setShowConfirmDialog(false);
     setIsMigrating(true);
     setMigrationResult(null);
@@ -1214,9 +1222,7 @@ const App = () => {
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   
   const [selectedVideo, setSelectedVideo] = useState<VideoData | null>(null);
-  const [loadingVideos, setLoadingVideos] = useState(false);
   const [dbMode, setDbMode] = useState<'local' | 'supabase'>('local');
-  const [fetchError, setFetchError] = useState('');
   
   const [activeSegmentIndex, setActiveSegmentIndex] = useState<number>(-1);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -1242,7 +1248,6 @@ const App = () => {
   }, [activeSegmentIndex]);
 
   const initData = async () => {
-    setLoadingVideos(true);
     const settings = MockDB.getSettings();
     
     // Priority: Supabase > Remote JSON > Local
@@ -1273,7 +1278,6 @@ const App = () => {
         allVideos = [...allVideos, ...localVideos];
         setVideos(allVideos);
     }
-    setLoadingVideos(false);
   };
   
   const handleSearch = async () => {
