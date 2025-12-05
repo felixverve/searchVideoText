@@ -81,6 +81,7 @@ interface SearchResult {
   segment: TranscriptSegment;
   isAiMatch?: boolean;
   aiReasoning?: string;
+  aiQuote?: string; // Added to support AI quote separation
 }
 
 // --- Mock Database (LocalStorage Wrapper) ---
@@ -260,10 +261,69 @@ const SupabaseService = {
     getClient: () => {
         const settings = MockDB.getSettings();
         if (!settings.supabaseUrl || !settings.supabaseKey) return null;
+        
+        // --- Fix: Auto-correct URL format to prevent CORS/Connection issues ---
+        let url = settings.supabaseUrl.trim();
+        
+        // 1. Intelligent Fix: Detect if user pasted Dashboard URL instead of API URL
+        // Dashboard: https://supabase.com/dashboard/project/abcde
+        // API:       https://abcde.supabase.co
+        if (url.includes('supabase.com/dashboard/project/')) {
+            const parts = url.split('project/');
+            if (parts[1]) {
+                const projectId = parts[1].split('/')[0]; // Handle potential trailing path
+                url = `https://${projectId}.supabase.co`;
+                console.log("Auto-corrected Supabase URL from Dashboard to API format.");
+            }
+        }
+
+        // 2. Ensure https:// protocol
+        if (!url.startsWith('http://') && !url.startsWith('https://')) {
+            url = `https://${url}`;
+        }
+        
+        // 3. Remove all trailing slashes to be safe
+        url = url.replace(/\/+$/, "");
+        
+        const key = settings.supabaseKey.trim();
+
         if (window.supabase) {
-            return window.supabase.createClient(settings.supabaseUrl, settings.supabaseKey);
+            try {
+                return window.supabase.createClient(url, key);
+            } catch (e) {
+                console.error("Supabase Init Failed (Invalid URL/Key):", e);
+                return null;
+            }
         }
         return null;
+    },
+
+    // --- New: Get All Videos (Metadata only) ---
+    getAllVideos: async (): Promise<VideoData[]> => {
+        const supabase = SupabaseService.getClient();
+        if (!supabase) return [];
+        try {
+            const { data, error } = await supabase
+                .from('videos')
+                .select('id, title, file_name, upload_date, public_url');
+                
+            if (error) {
+                console.warn("Fetch All Videos Error:", error.message);
+                return [];
+            }
+            // Return videos with empty transcript initially
+            return data.map((v: any) => ({
+                id: v.id,
+                title: v.title,
+                fileName: v.file_name,
+                uploadDate: v.upload_date,
+                publicUrl: v.public_url,
+                transcript: [] 
+            }));
+        } catch (e) {
+            console.error("Connection Error during getAllVideos:", e);
+            return [];
+        }
     },
 
     // --- Video & Transcript Logic ---
@@ -271,63 +331,139 @@ const SupabaseService = {
         const supabase = SupabaseService.getClient();
         if (!supabase) return [];
         
-        const keywords = query.trim().split(/\s+/);
+        // Split and sanitize keywords
+        const keywords = query.trim().split(/\s+/).map(k => k.toLowerCase()).filter(k => k);
         if (keywords.length === 0) return [];
         
-        const { data, error } = await supabase
-            .from('transcripts')
-            .select(`*, videos (id, title, file_name, upload_date, public_url)`)
-            .ilike('text', `%${keywords[0]}%`)
-            .limit(50);
+        try {
+            // New Logic: Video-level Linkage
+            // 1. We want segments that match ANY of the keywords.
+            // 2. We will group them by video.
+            // 3. We will filter videos that contain ALL keywords across their segments.
+            
+            // Build OR filter: text.ilike.%k1%,text.ilike.%k2%
+            const orFilter = keywords.map(k => `text.ilike.%${k}%`).join(',');
 
-        if (error) { console.error("Supabase Search Error:", error); throw error; }
-        if (!data) return [];
+            // Fetch a larger batch to ensure we catch distributed keyword matches
+            // Note: We select segments that have AT LEAST ONE keyword.
+            const { data, error } = await supabase
+                .from('transcripts')
+                .select(`*, videos (id, title, file_name, upload_date, public_url)`)
+                .or(orFilter)
+                .order('video_id', { ascending: true }) // Important for grouping
+                .order('seconds', { ascending: true })  // Time order
+                .limit(2000); // Increased limit to support "whole video" search
 
-        const filtered = data.filter((item: any) => {
-             const text = item.text.toLowerCase();
-             return keywords.every(k => text.includes(k.toLowerCase()));
-        });
-
-        return filtered.map((item: any) => ({
-            video: {
-                id: item.videos.id,
-                title: item.videos.title,
-                fileName: item.videos.file_name,
-                uploadDate: item.videos.upload_date,
-                publicUrl: item.videos.public_url,
-                transcript: [], 
-            },
-            segment: {
-                startTime: item.start_time,
-                endTime: item.end_time,
-                text: item.text,
-                seconds: item.seconds
+            if (error) { 
+                console.warn("Supabase Search Error:", error.message); 
+                return []; 
             }
-        }));
+            if (!data) return [];
+
+            // Client-side Aggregation
+            const videoGroups = new Map<string, {
+                video: any,
+                segments: any[],
+                matchedKeywords: Set<string>
+            }>();
+
+            data.forEach((row: any) => {
+                const vid = row.video_id;
+                if (!videoGroups.has(vid)) {
+                    videoGroups.set(vid, {
+                        video: row.videos,
+                        segments: [],
+                        matchedKeywords: new Set()
+                    });
+                }
+                
+                const group = videoGroups.get(vid)!;
+                const textLower = (row.text || '').toLowerCase();
+                
+                // Identify which keywords this particular segment contains
+                let hasMatch = false;
+                keywords.forEach(k => {
+                    if (textLower.includes(k)) {
+                        group.matchedKeywords.add(k);
+                        hasMatch = true;
+                    }
+                });
+
+                // If segment matches any keyword, add it to candidates
+                if (hasMatch) {
+                    group.segments.push(row);
+                }
+            });
+
+            const results: SearchResult[] = [];
+            
+            // Filter: Only keep videos where ALL keywords were found somewhere in the video (AND condition)
+            for (const group of videoGroups.values()) {
+                const hasAllKeywords = keywords.every(k => group.matchedKeywords.has(k));
+                
+                if (hasAllKeywords) {
+                    // Add all matching segments (OR condition segments) from this valid video
+                    group.segments.forEach(seg => {
+                        results.push({
+                            video: {
+                                id: group.video.id,
+                                title: group.video.title,
+                                fileName: group.video.file_name,
+                                uploadDate: group.video.upload_date,
+                                publicUrl: group.video.public_url,
+                                transcript: [], 
+                            },
+                            segment: {
+                                startTime: seg.start_time,
+                                endTime: seg.end_time,
+                                text: seg.text,
+                                seconds: seg.seconds
+                            },
+                            // Mark as AI/Smart match to highlight this logic
+                            isAiMatch: true,
+                            aiReasoning: `多词联动匹配: ${keywords.join(' + ')}`
+                        });
+                    });
+                }
+            }
+
+            return results;
+        } catch (e) {
+             console.error("Connection Error during search:", e);
+             return [];
+        }
     },
 
     fetchTranscript: async (videoId: string): Promise<TranscriptSegment[]> => {
         const supabase = SupabaseService.getClient();
         if (!supabase) return [];
 
-        const { data, error } = await supabase
-            .from('transcripts')
-            .select('*')
-            .eq('video_id', videoId)
-            .order('seconds', { ascending: true });
-            
-        if (error) return [];
-        return data.map((item: any) => ({
-            startTime: item.start_time,
-            endTime: item.end_time,
-            text: item.text,
-            seconds: item.seconds
-        }));
+        try {
+            const { data, error } = await supabase
+                .from('transcripts')
+                .select('*')
+                .eq('video_id', videoId)
+                .order('seconds', { ascending: true });
+                
+            if (error) {
+                console.warn("Fetch Transcript Error:", error.message);
+                return [];
+            }
+            return data.map((item: any) => ({
+                startTime: item.start_time,
+                endTime: item.end_time,
+                text: item.text,
+                seconds: item.seconds
+            }));
+        } catch (e) {
+            console.error("Connection Error during transcript fetch:", e);
+            return [];
+        }
     },
     
     uploadData: async (videos: VideoData[], onProgress: (msg: string) => void) => {
         const supabase = SupabaseService.getClient();
-        if (!supabase) throw new Error("Supabase 未配置");
+        if (!supabase) throw new Error("Supabase 未配置或 URL 格式错误");
 
         for (let i = 0; i < videos.length; i++) {
             const v = videos[i];
@@ -363,24 +499,39 @@ const SupabaseService = {
     getUsers: async (): Promise<UserAccount[]> => {
         const supabase = SupabaseService.getClient();
         if (!supabase) return [];
-        const { data, error } = await supabase.from('app_users').select('*').order('username');
-        if (error) { console.error("Fetch Users Error", error); return []; }
-        return data as UserAccount[];
+        try {
+            const { data, error } = await supabase.from('app_users').select('*').order('username');
+            if (error) { 
+                console.warn("Fetch Users Error:", error.message); 
+                return []; 
+            }
+            return data as UserAccount[];
+        } catch (e) {
+            console.error("Connection Error during getUsers:", e);
+            return [];
+        }
     },
 
     loginUser: async (username: string, password: string): Promise<UserAccount | null> => {
         const supabase = SupabaseService.getClient();
         if (!supabase) return null;
-        // WARNING: In production, password checking should be done securely (e.g. hashing)
-        const { data, error } = await supabase
-            .from('app_users')
-            .select('*')
-            .eq('username', username)
-            .eq('password', password) // Basic comparison
-            .single();
-        
-        if (error || !data) return null;
-        return data as UserAccount;
+        try {
+            const { data, error } = await supabase
+                .from('app_users')
+                .select('*')
+                .eq('username', username)
+                .eq('password', password) // Basic comparison
+                .single();
+            
+            if (error) {
+                console.warn("Login Query Error:", error.message);
+                return null;
+            }
+            return data as UserAccount;
+        } catch (e) {
+             console.error("Connection Error during login:", e);
+             return null;
+        }
     },
 
     registerUser: async (user: UserAccount): Promise<void> => {
@@ -499,32 +650,46 @@ const cozeSearch = async (
            const parsed = JSON.parse(jsonString);
            const mappedResults: SearchResult[] = [];
            
-           // Note: Coze search only searches local videos array currently. 
-           // If using Supabase, Coze needs its own Knowledge Base updated separately.
            parsed.forEach((item: any) => {
+             // Match video based on ID or flexible title search
              const vid = localVideos.find(v => 
                v.id === item.videoId || 
-               v.title.toLowerCase().includes((item.videoId || '').toLowerCase())
+               v.title.toLowerCase().includes((item.videoId || '').toLowerCase()) ||
+               (v.fileName && v.fileName.toLowerCase().includes((item.videoId || '').toLowerCase()))
              );
              
              if (vid) {
                const seconds = timeToSeconds(item.timestamp || "00:00:00");
-               let closestSegment = vid.transcript[0];
-               let minDiff = Infinity;
+               let closestSegment: TranscriptSegment;
                
-               vid.transcript.forEach(seg => {
-                   const diff = Math.abs(seg.seconds - seconds);
-                   if (diff < minDiff) {
-                       minDiff = diff;
-                       closestSegment = seg;
-                   }
-               });
+               // Logic Update: Handle case where transcript is empty (Supabase Metadata Mode)
+               if (vid.transcript && vid.transcript.length > 0) {
+                   closestSegment = vid.transcript[0];
+                   let minDiff = Infinity;
+                   vid.transcript.forEach(seg => {
+                       const diff = Math.abs(seg.seconds - seconds);
+                       if (diff < minDiff) {
+                           minDiff = diff;
+                           closestSegment = seg;
+                       }
+                   });
+               } else {
+                   // Fallback for metadata-only videos: Create a synthetic segment
+                   // This ensures the result is clickable and redirects to the correct time
+                   closestSegment = {
+                       startTime: item.timestamp || "00:00:00",
+                       endTime: "",
+                       text: item.quote || "AI 智能定位片段 (点击加载详情)",
+                       seconds: seconds
+                   };
+               }
 
                mappedResults.push({
                  video: vid,
                  segment: closestSegment,
                  isAiMatch: true,
-                 aiReasoning: item.reasoning || item.quote
+                 aiReasoning: item.reasoning || item.thought,
+                 aiQuote: item.quote || item.content 
                });
              }
            });
@@ -539,22 +704,34 @@ const cozeSearch = async (
 };
 
 const fallbackSearch = (query: string, localVideos: VideoData[]): SearchResult[] => {
-    const keywords = query.toLowerCase().split(/\s+/);
+    // Sanitize input
+    const keywords = query.toLowerCase().trim().split(/\s+/).filter(k => k);
+    if (keywords.length === 0) return [];
+
     const results: SearchResult[] = [];
     
     localVideos.forEach(video => {
-      const fullText = video.transcript.map(t => t.text).join(' ').toLowerCase();
-      const isVideoMatch = keywords.every(k => fullText.includes(k));
+      // Skip if no transcript loaded (e.g. Supabase mode fallback)
+      if (!video.transcript || video.transcript.length === 0) return;
 
-      if (isVideoMatch) {
+      // 1. New Logic: Check if the WHOLE video transcript contains ALL keywords (AND condition)
+      const fullText = video.transcript.map(t => t.text).join(' ').toLowerCase();
+      const hasAllKeywords = keywords.every(k => fullText.includes(k));
+
+      if (hasAllKeywords) {
+          // 2. If video qualifies, find ALL segments that contain ANY of the keywords (OR condition)
           video.transcript.forEach(segment => {
             const text = segment.text.toLowerCase();
-            if (keywords.some(k => text.includes(k))) {
+            
+            // Check if this segment contains at least one keyword
+            const matchesAny = keywords.some(k => text.includes(k));
+
+            if (matchesAny) {
               results.push({
                 video,
                 segment,
                 isAiMatch: true,
-                aiReasoning: `全匹配视频中的片段`
+                aiReasoning: `全匹配视频中的片段 (包含: ${keywords.filter(k => text.includes(k)).join(', ')})`
               });
             }
           });
@@ -569,7 +746,6 @@ const AuthScreen = ({ onLogin }: { onLogin: (user: UserAccount) => void }) => {
   const [isRegister, setIsRegister] = useState(false);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
-  const [rememberMe, setRememberMe] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [isAutoLoggingIn, setIsAutoLoggingIn] = useState(true);
@@ -605,8 +781,10 @@ const AuthScreen = ({ onLogin }: { onLogin: (user: UserAccount) => void }) => {
         if (!isAuto) setError('您的账号已被拒绝。');
         if (isAuto) setIsAutoLoggingIn(false);
     } else {
-        if (!isAuto && rememberMe) MockDB.saveRememberedUser(usr, pwd);
-        if (!isAuto && !rememberMe) MockDB.clearRememberedUser();
+        // ALWAYS save for persistence unless explicit logout
+        if (!isAuto) {
+            MockDB.saveRememberedUser(usr, pwd);
+        }
         onLogin(user);
     }
   };
@@ -616,7 +794,6 @@ const AuthScreen = ({ onLogin }: { onLogin: (user: UserAccount) => void }) => {
     if (saved) {
       setUsername(saved.username);
       setPassword(saved.password);
-      setRememberMe(true);
       attemptLogin(saved.username, saved.password, true);
     } else {
         setIsAutoLoggingIn(false);
@@ -699,13 +876,6 @@ const AuthScreen = ({ onLogin }: { onLogin: (user: UserAccount) => void }) => {
               value={password} onChange={e => setPassword(e.target.value)}
             />
           </div>
-          {!isRegister && (
-            <div className="flex items-center">
-              <input id="remember_me" type="checkbox" className="w-4 h-4 text-indigo-600 bg-slate-700 border-slate-600 rounded"
-                checked={rememberMe} onChange={e => setRememberMe(e.target.checked)} />
-              <label htmlFor="remember_me" className="ml-2 text-sm text-slate-400">记住账号密码</label>
-            </div>
-          )}
           <button type="submit" className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-2 rounded transition">
             {isRegister ? '注册' : '登录'}
           </button>
@@ -1254,7 +1424,10 @@ const App = () => {
     if (settings.supabaseUrl && settings.supabaseKey) {
         console.log("Initializing in Supabase Mode");
         setDbMode('supabase');
-        setVideos([]); // Clear videos to avoid confusion, Supabase handles search
+        // FIX: Fetch video metadata so Coze AI can map IDs/Titles to objects
+        // We load metadata ONLY (no transcripts) to save bandwidth but enable search matching
+        const cloudVideos = await SupabaseService.getAllVideos();
+        setVideos(cloudVideos); 
     } else {
         console.log("Initializing in Local/Remote Mode");
         setDbMode('local');
@@ -1324,35 +1497,76 @@ const App = () => {
       const file = e.target.files?.[0];
       if (file && selectedVideo) {
            const url = URL.createObjectURL(file);
-           if (dbMode === 'local') {
-               // Update local state
-               setVideos(prev => prev.map(v => v.id === selectedVideo.id ? { ...v, dataUrl: url } : v));
-           }
-           // For both modes, update current selection reference to play immediately
+           
+           // FIX: Always update the global videos cache with the new dataUrl, 
+           // regardless of dbMode. This ensures search results can 'find' the loaded file.
+           setVideos(prev => prev.map(v => v.id === selectedVideo.id ? { ...v, dataUrl: url } : v));
+           
+           // Update current selection reference to play immediately
            setSelectedVideo(prev => prev ? { ...prev, dataUrl: url } : null);
       }
   };
   
   const handleSearchResultClick = async (result: SearchResult) => {
-      // If using Supabase, we might not have the full transcript yet
-      if (dbMode === 'supabase' && (!result.video.transcript || result.video.transcript.length === 0)) {
-           // Fetch full transcript on demand
-           const fullTranscript = await SupabaseService.fetchTranscript(result.video.id);
-           result.video.transcript = fullTranscript;
+      let targetVideo = result.video;
+
+      // --- FIX 1: Merge with existing state to preserve DataURL (Local File) ---
+      // When searching, we get a "fresh" video object from DB/Search that lacks the local blob URL.
+      // We must check if we already have a version of this video loaded in memory.
+      const cachedVideo = videos.find(v => v.id === targetVideo.id);
+      
+      if (cachedVideo) {
+          // Preserve the local file URL if user already uploaded it
+          if (cachedVideo.dataUrl) {
+              targetVideo.dataUrl = cachedVideo.dataUrl;
+          }
+          // If the search result has no transcript (e.g. metadata only), but cache does, use cache
+          if ((!targetVideo.transcript || targetVideo.transcript.length === 0) && cachedVideo.transcript && cachedVideo.transcript.length > 0) {
+              targetVideo.transcript = cachedVideo.transcript;
+          }
       }
 
-      setSelectedVideo(result.video);
+      // --- FIX 2: Check current selected video as well (Redundancy) ---
+      if (selectedVideo && selectedVideo.id === targetVideo.id && selectedVideo.dataUrl && !targetVideo.dataUrl) {
+           targetVideo.dataUrl = selectedVideo.dataUrl;
+      }
+
+      // If using Supabase, we might not have the full transcript yet
+      if (dbMode === 'supabase' && (!targetVideo.transcript || targetVideo.transcript.length === 0)) {
+           // Fetch full transcript on demand
+           const fullTranscript = await SupabaseService.fetchTranscript(targetVideo.id);
+           targetVideo.transcript = fullTranscript;
+           
+           // Update cache so we don't fetch again
+           setVideos(prev => prev.map(v => v.id === targetVideo.id ? { ...v, transcript: fullTranscript } : v));
+      }
+
+      setSelectedVideo({ ...targetVideo });
       
-      const index = result.video.transcript.findIndex(t => t.startTime === result.segment.startTime);
+      // --- FIX 3: Robust Index Finding (Fuzzy Match) ---
+      // Sometimes seconds differ slightly between systems (0.5s diff), causing findIndex to fail with strict equality
+      let index = -1;
+      if (targetVideo.transcript && targetVideo.transcript.length > 0) {
+          // A. Try exact match
+          index = targetVideo.transcript.findIndex(t => t.startTime === result.segment.startTime);
+          
+          // B. Try fuzzy match (within 1 second)
+          if (index === -1) {
+              index = targetVideo.transcript.findIndex(t => Math.abs(t.seconds - result.segment.seconds) < 1.0);
+          }
+      }
+
       if (index !== -1) setActiveSegmentIndex(index);
+      
+      // Delay seek slightly to ensure video element is ready/mounted with new source
       setTimeout(() => handleSeek(result.segment.seconds), 100);
   };
 
   if (!currentUser) return <AuthScreen onLogin={setCurrentUser} />;
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-200 font-sans">
-      <header className="bg-slate-900 border-b border-slate-800 sticky top-0 z-40">
+    <div className="h-screen bg-slate-950 text-slate-200 font-sans flex flex-col overflow-hidden">
+      <header className="bg-slate-900 border-b border-slate-800 flex-shrink-0 z-40">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="bg-indigo-600 p-2 rounded-lg"><Database className="w-5 h-5 text-white" /></div>
@@ -1382,46 +1596,74 @@ const App = () => {
         </div>
       </header>
 
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-          {/* Search Column */}
-          <div className="lg:col-span-1 space-y-6">
-            <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg">
+      <main className="flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 overflow-hidden">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 h-full">
+          {/* Search Column - Independently scrollable */}
+          <div className="lg:col-span-1 flex flex-col h-full min-h-0 gap-4">
+            <div className="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg flex-shrink-0">
               <div className="flex justify-between items-center mb-4">
                   <h2 className="text-lg font-semibold text-white">内容搜索</h2>
                   <button onClick={() => setIsAiSearch(!isAiSearch)} className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-bold transition border ${isAiSearch ? 'bg-indigo-600 text-white border-indigo-500' : 'bg-slate-700 text-slate-400 border-slate-600'}`}>
                     <Sparkles className="w-3 h-3" /> {isAiSearch ? 'AI 模式' : '关键词'}
                   </button>
               </div>
-              <div className="relative">
-                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400">{isSearching ? <Loader2 className="w-5 h-5 animate-spin"/> : <Search className="w-5 h-5"/>}</span>
-                <input type="text" placeholder={isAiSearch ? "输入问题..." : "搜索关键词..."} 
-                    className="w-full bg-slate-900 border border-slate-700 pl-10 pr-4 py-3 rounded-lg text-white outline-none focus:border-indigo-500"
-                    value={searchQuery} onChange={e => setSearchQuery(e.target.value)} />
+              <div className="relative flex items-center gap-2">
+                <div className="relative flex-1">
+                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400">{isSearching ? <Loader2 className="w-5 h-5 animate-spin"/> : <Search className="w-5 h-5"/>}</span>
+                    <input type="text" placeholder={isAiSearch ? "输入问题..." : "搜索关键词..."} 
+                        className="w-full bg-slate-900 border border-slate-700 pl-10 pr-4 py-3 rounded-lg text-white outline-none focus:border-indigo-500 transition-colors"
+                        value={searchQuery} onChange={e => setSearchQuery(e.target.value)} 
+                        onKeyDown={(e) => e.key === 'Enter' && handleSearch()} />
+                </div>
+                <button 
+                    onClick={() => handleSearch()} 
+                    disabled={isSearching}
+                    className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white px-5 rounded-lg font-medium transition flex items-center justify-center h-full">
+                    搜索
+                </button>
               </div>
             </div>
 
-            <div className="space-y-4">
+            <div className="flex-1 overflow-y-auto space-y-3 pr-1 pb-2">
+              {searchResults.length === 0 && !searchQuery && (
+                  <div className="text-center text-slate-500 py-10 flex flex-col items-center">
+                      <Search className="w-10 h-10 opacity-20 mb-2"/>
+                      <p className="text-sm">请输入关键词开始搜索</p>
+                  </div>
+              )}
               {searchResults.map((result, idx) => (
                 <div key={idx} onClick={() => handleSearchResultClick(result)}
-                  className={`border p-4 rounded-lg cursor-pointer transition relative overflow-hidden ${result.isAiMatch ? 'bg-indigo-900/10 border-indigo-500/30' : 'bg-slate-800/50 border-slate-700/50 hover:bg-slate-800'}`}>
+                  className={`border p-4 rounded-lg cursor-pointer transition relative overflow-hidden flex-shrink-0 ${result.isAiMatch ? 'bg-indigo-900/10 border-indigo-500/30' : 'bg-slate-800/50 border-slate-700/50 hover:bg-slate-800'}`}>
                   <div className="flex justify-between items-start mb-2">
                     <span className="text-xs font-medium px-2 py-0.5 rounded text-indigo-400 bg-indigo-400/10">{result.segment.startTime}</span>
                     <span className="text-slate-500"><HardDrive className="w-3 h-3" /></span>
                   </div>
-                  <p className="text-slate-200 text-sm leading-relaxed mb-2">"... <span className={!isAiSearch ? "text-white font-medium bg-indigo-600/20" : ""}>{result.segment.text}</span> ..."</p>
-                  <p className="text-xs text-slate-500 truncate">{result.video.title}</p>
+                  <p className="text-slate-200 text-sm leading-relaxed mb-2">
+                    {result.isAiMatch && result.aiQuote ? (
+                      <span className="text-white font-medium italic">"{result.aiQuote}"</span>
+                    ) : (
+                      <span>"... <span className={!isAiSearch ? "text-white font-medium bg-indigo-600/20" : ""}>{result.segment.text}</span> ..."</span>
+                    )}
+                  </p>
+                  
+                  {result.isAiMatch && result.aiReasoning && (
+                    <div className="mt-2 text-xs text-indigo-300 bg-indigo-500/10 p-2.5 rounded-lg border border-indigo-500/20 leading-relaxed">
+                       <span className="font-bold mr-1 opacity-75">AI 解析:</span> {result.aiReasoning}
+                    </div>
+                  )}
+
+                  <p className="text-xs text-slate-500 truncate mt-2 border-t border-slate-700/50 pt-2">{result.video.title}</p>
                 </div>
               ))}
             </div>
           </div>
 
-          {/* Player Column */}
-          <div className="lg:col-span-2">
-            <div className="bg-black rounded-xl overflow-hidden shadow-2xl border border-slate-800 sticky top-24">
-                <div className="aspect-video bg-black relative flex items-center justify-center border-b border-slate-800">
+          {/* Player Column - Independently scrollable transcript */}
+          <div className="lg:col-span-2 h-full min-h-0 flex flex-col">
+            <div className="bg-slate-900 rounded-xl overflow-hidden shadow-2xl border border-slate-800 flex flex-col h-full">
+                <div className="bg-black relative flex items-center justify-center border-b border-slate-800 flex-shrink-0 h-[40%] min-h-[200px]">
                   {selectedVideo && (selectedVideo.publicUrl || selectedVideo.dataUrl) ? (
-                    <video ref={videoRef} src={selectedVideo.publicUrl || selectedVideo.dataUrl} controls className="w-full h-full" />
+                    <video ref={videoRef} src={selectedVideo.publicUrl || selectedVideo.dataUrl} controls className="w-full h-full object-contain" />
                   ) : selectedVideo ? (
                     <div className="text-center p-8 max-w-md">
                       <div className="bg-slate-800 p-4 rounded-full inline-block mb-4"><HardDrive className="w-8 h-8 text-indigo-400" /></div>
@@ -1437,21 +1679,26 @@ const App = () => {
                   )}
                 </div>
                 
-                <div className="p-6 bg-slate-800 h-[400px] flex flex-col">
-                  {selectedVideo ? (
-                      <>
-                        <h2 className="text-xl font-bold text-white truncate mb-1">{selectedVideo.title}</h2>
-                        <div className="flex gap-4 text-sm text-slate-400 mb-6"><span>ID: {selectedVideo.id.split('_')[1] || '...'}</span></div>
-                      </>
-                  ) : <div className="mb-8 border-b border-slate-700/50 pb-4 h-10 animate-pulse bg-slate-700/20 rounded"></div>}
+                <div className="bg-slate-800 flex-1 flex flex-col min-h-0 relative">
+                  <div className="px-4 py-3 border-b border-slate-700/50 flex-shrink-0 bg-slate-800 z-10">
+                    {selectedVideo ? (
+                        <>
+                            <h2 className="text-lg font-bold text-white truncate">{selectedVideo.title}</h2>
+                            <div className="text-xs text-slate-500 mt-1">ID: {selectedVideo.id.split('_')[1] || '...'}</div>
+                        </>
+                    ) : <div className="h-6 w-1/3 bg-slate-700/50 rounded animate-pulse"></div>}
+                  </div>
+
+                  <div className="px-4 py-2 bg-slate-800/80 text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-2 border-b border-slate-700/30 flex-shrink-0 backdrop-blur-sm z-10 sticky top-0">
+                     <Files className="w-3 h-3" /> 全文记录
+                  </div>
                   
-                  <h3 className="text-sm font-semibold text-white uppercase tracking-wider mb-3">全文记录</h3>
-                  <div ref={transcriptRef} className="flex-1 overflow-y-auto space-y-1 pr-2 custom-scrollbar scroll-smooth bg-slate-900/50 rounded-lg p-2 border border-slate-700/50">
+                  <div ref={transcriptRef} className="flex-1 overflow-y-auto p-4 space-y-3 custom-scrollbar scroll-smooth">
                     {selectedVideo?.transcript?.map((t, i) => (
                       <div key={i} onClick={() => { setActiveSegmentIndex(i); if (selectedVideo.dataUrl || selectedVideo.publicUrl) handleSeek(t.seconds); }}
-                        className={`flex gap-4 p-2 rounded cursor-pointer group text-sm transition-colors border-l-2 ${activeSegmentIndex === i ? 'bg-indigo-600/20 border-indigo-500' : 'border-transparent hover:bg-slate-700/50'}`}>
+                        className={`flex gap-4 p-2.5 rounded cursor-pointer group text-sm transition-colors border-l-2 ${activeSegmentIndex === i ? 'bg-indigo-600/20 border-indigo-500' : 'border-transparent hover:bg-slate-700/50'}`}>
                         <span className={`font-mono min-w-[50px] text-xs pt-0.5 ${activeSegmentIndex === i ? 'text-indigo-300 font-bold' : 'text-slate-600'}`}>{t.startTime}</span>
-                        <p className={activeSegmentIndex === i ? 'text-white' : 'text-slate-400'}>{t.text}</p>
+                        <p className={`leading-relaxed ${activeSegmentIndex === i ? 'text-white' : 'text-slate-400'}`}>{t.text}</p>
                       </div>
                     )) || <div className="text-center text-slate-600 text-sm mt-10">暂无内容</div>}
                   </div>
