@@ -23,7 +23,8 @@ import {
   Files,
   Trash2,
   Check,
-  Users
+  Users,
+  Info
 } from 'lucide-react';
 
 // --- Global Types for UMD libs ---
@@ -255,23 +256,20 @@ const parseSubtitleFile = (content: string): TranscriptSegment[] => {
   return segments;
 };
 
-// --- Supabase Service (Plan B) ---
+// --- Supabase Service (Defined locally to avoid import errors) ---
 
 const SupabaseService = {
     getClient: () => {
         const settings = MockDB.getSettings();
         if (!settings.supabaseUrl || !settings.supabaseKey) return null;
         
-        // --- Fix: Auto-correct URL format to prevent CORS/Connection issues ---
         let url = settings.supabaseUrl.trim();
         
         // 1. Intelligent Fix: Detect if user pasted Dashboard URL instead of API URL
-        // Dashboard: https://supabase.com/dashboard/project/abcde
-        // API:       https://abcde.supabase.co
         if (url.includes('supabase.com/dashboard/project/')) {
             const parts = url.split('project/');
             if (parts[1]) {
-                const projectId = parts[1].split('/')[0]; // Handle potential trailing path
+                const projectId = parts[1].split('/')[0];
                 url = `https://${projectId}.supabase.co`;
                 console.log("Auto-corrected Supabase URL from Dashboard to API format.");
             }
@@ -282,7 +280,7 @@ const SupabaseService = {
             url = `https://${url}`;
         }
         
-        // 3. Remove all trailing slashes to be safe
+        // 3. Remove all trailing slashes
         url = url.replace(/\/+$/, "");
         
         const key = settings.supabaseKey.trim();
@@ -298,7 +296,6 @@ const SupabaseService = {
         return null;
     },
 
-    // --- New: Get All Videos (Metadata only) ---
     getAllVideos: async (): Promise<VideoData[]> => {
         const supabase = SupabaseService.getClient();
         if (!supabase) return [];
@@ -311,7 +308,6 @@ const SupabaseService = {
                 console.warn("Fetch All Videos Error:", error.message);
                 return [];
             }
-            // Return videos with empty transcript initially
             return data.map((v: any) => ({
                 id: v.id,
                 title: v.title,
@@ -326,33 +322,25 @@ const SupabaseService = {
         }
     },
 
-    // --- Video & Transcript Logic ---
     search: async (query: string): Promise<SearchResult[]> => {
         const supabase = SupabaseService.getClient();
         if (!supabase) return [];
         
-        // Split and sanitize keywords
         const keywords = query.trim().split(/\s+/).map(k => k.toLowerCase()).filter(k => k);
         if (keywords.length === 0) return [];
         
         try {
-            // New Logic: Video-level Linkage
-            // 1. We want segments that match ANY of the keywords.
-            // 2. We will group them by video.
-            // 3. We will filter videos that contain ALL keywords across their segments.
-            
             // Build OR filter: text.ilike.%k1%,text.ilike.%k2%
             const orFilter = keywords.map(k => `text.ilike.%${k}%`).join(',');
 
-            // Fetch a larger batch to ensure we catch distributed keyword matches
-            // Note: We select segments that have AT LEAST ONE keyword.
+            // Fetch segments matching ANY keyword
             const { data, error } = await supabase
                 .from('transcripts')
                 .select(`*, videos (id, title, file_name, upload_date, public_url)`)
                 .or(orFilter)
-                .order('video_id', { ascending: true }) // Important for grouping
-                .order('seconds', { ascending: true })  // Time order
-                .limit(2000); // Increased limit to support "whole video" search
+                .order('video_id', { ascending: true })
+                .order('seconds', { ascending: true })
+                .limit(2000);
 
             if (error) { 
                 console.warn("Supabase Search Error:", error.message); 
@@ -380,7 +368,6 @@ const SupabaseService = {
                 const group = videoGroups.get(vid)!;
                 const textLower = (row.text || '').toLowerCase();
                 
-                // Identify which keywords this particular segment contains
                 let hasMatch = false;
                 keywords.forEach(k => {
                     if (textLower.includes(k)) {
@@ -389,7 +376,6 @@ const SupabaseService = {
                     }
                 });
 
-                // If segment matches any keyword, add it to candidates
                 if (hasMatch) {
                     group.segments.push(row);
                 }
@@ -397,12 +383,11 @@ const SupabaseService = {
 
             const results: SearchResult[] = [];
             
-            // Filter: Only keep videos where ALL keywords were found somewhere in the video (AND condition)
+            // Filter: Video must contain ALL keywords
             for (const group of videoGroups.values()) {
                 const hasAllKeywords = keywords.every(k => group.matchedKeywords.has(k));
                 
                 if (hasAllKeywords) {
-                    // Add all matching segments (OR condition segments) from this valid video
                     group.segments.forEach(seg => {
                         results.push({
                             video: {
@@ -419,7 +404,6 @@ const SupabaseService = {
                                 text: seg.text,
                                 seconds: seg.seconds
                             },
-                            // Mark as AI/Smart match to highlight this logic
                             isAiMatch: true,
                             aiReasoning: `多词联动匹配: ${keywords.join(' + ')}`
                         });
@@ -468,6 +452,8 @@ const SupabaseService = {
         for (let i = 0; i < videos.length; i++) {
             const v = videos[i];
             onProgress(`正在上传视频 (${i + 1}/${videos.length}): ${v.title}`);
+            
+            // 1. Upsert video metadata
             const { error: vError } = await supabase.from('videos').upsert({
                 id: v.id,
                 title: v.title,
@@ -477,6 +463,18 @@ const SupabaseService = {
             });
             if (vError) throw new Error(`上传视频 ${v.title} 失败: ${vError.message}`);
 
+            // 2. CRITICAL FIX: Delete existing transcripts for this video to prevent duplicates
+            // We delete all transcripts for this video_id before inserting new ones.
+            const { error: delError } = await supabase
+                .from('transcripts')
+                .delete()
+                .eq('video_id', v.id);
+            
+            if (delError) {
+                console.warn(`清理旧字幕失败 (Video ID: ${v.id}):`, delError.message);
+            }
+
+            // 3. Insert new transcripts
             const transcriptRows = v.transcript.map(t => ({
                 video_id: v.id,
                 start_time: t.startTime,
@@ -493,8 +491,6 @@ const SupabaseService = {
         }
         onProgress("上传完成！");
     },
-
-    // --- User Management Logic ---
 
     getUsers: async (): Promise<UserAccount[]> => {
         const supabase = SupabaseService.getClient();
@@ -520,7 +516,7 @@ const SupabaseService = {
                 .from('app_users')
                 .select('*')
                 .eq('username', username)
-                .eq('password', password) // Basic comparison
+                .eq('password', password)
                 .single();
             
             if (error) {
@@ -565,7 +561,6 @@ const SupabaseService = {
         const supabase = SupabaseService.getClient();
         if (!supabase) throw new Error("DB not connected");
         
-        // Remove admin-1 duplicate if exists in cloud (or upsert)
         for (const u of users) {
              const { error } = await supabase.from('app_users').upsert({
                 id: u.id,
@@ -587,14 +582,12 @@ const cozeSearch = async (
   settings: AppSettings, 
   localVideos: VideoData[]
 ): Promise<SearchResult[]> => {
-  // 1. Check Config
   if (!settings.cozeApiKey || !settings.cozeBotId) {
     console.warn("Coze credentials missing. Using local simulation.");
     await new Promise(resolve => setTimeout(resolve, 1000)); 
     return fallbackSearch(query, localVideos);
   }
 
-  // 2. Real API Call
   const baseUrl = settings.cozeBaseUrl || 'https://api.coze.cn';
   const endpoint = `${baseUrl}/open_api/v2/chat`;
 
@@ -633,7 +626,6 @@ const cozeSearch = async (
     
     if (answerMessage) {
          const content = answerMessage.content;
-         // Try to extract JSON
          let jsonString = '';
          const markdownMatch = content.match(/```json\s*([\s\S]*?)\s*```/);
          if (markdownMatch) {
@@ -651,7 +643,6 @@ const cozeSearch = async (
            const mappedResults: SearchResult[] = [];
            
            parsed.forEach((item: any) => {
-             // Match video based on ID or flexible title search
              const vid = localVideos.find(v => 
                v.id === item.videoId || 
                v.title.toLowerCase().includes((item.videoId || '').toLowerCase()) ||
@@ -662,7 +653,6 @@ const cozeSearch = async (
                const seconds = timeToSeconds(item.timestamp || "00:00:00");
                let closestSegment: TranscriptSegment;
                
-               // Logic Update: Handle case where transcript is empty (Supabase Metadata Mode)
                if (vid.transcript && vid.transcript.length > 0) {
                    closestSegment = vid.transcript[0];
                    let minDiff = Infinity;
@@ -674,8 +664,6 @@ const cozeSearch = async (
                        }
                    });
                } else {
-                   // Fallback for metadata-only videos: Create a synthetic segment
-                   // This ensures the result is clickable and redirects to the correct time
                    closestSegment = {
                        startTime: item.timestamp || "00:00:00",
                        endTime: "",
@@ -704,26 +692,20 @@ const cozeSearch = async (
 };
 
 const fallbackSearch = (query: string, localVideos: VideoData[]): SearchResult[] => {
-    // Sanitize input
     const keywords = query.toLowerCase().trim().split(/\s+/).filter(k => k);
     if (keywords.length === 0) return [];
 
     const results: SearchResult[] = [];
     
     localVideos.forEach(video => {
-      // Skip if no transcript loaded (e.g. Supabase mode fallback)
       if (!video.transcript || video.transcript.length === 0) return;
 
-      // 1. New Logic: Check if the WHOLE video transcript contains ALL keywords (AND condition)
       const fullText = video.transcript.map(t => t.text).join(' ').toLowerCase();
       const hasAllKeywords = keywords.every(k => fullText.includes(k));
 
       if (hasAllKeywords) {
-          // 2. If video qualifies, find ALL segments that contain ANY of the keywords (OR condition)
           video.transcript.forEach(segment => {
             const text = segment.text.toLowerCase();
-            
-            // Check if this segment contains at least one keyword
             const matchesAny = keywords.some(k => text.includes(k));
 
             if (matchesAny) {
@@ -750,11 +732,9 @@ const AuthScreen = ({ onLogin }: { onLogin: (user: UserAccount) => void }) => {
   const [success, setSuccess] = useState('');
   const [isAutoLoggingIn, setIsAutoLoggingIn] = useState(true);
 
-  // Check login logic: Local vs Cloud
   const attemptLogin = async (usr: string, pwd: string, isAuto: boolean) => {
     let user: UserAccount | null = null;
     
-    // 1. Try Supabase First if configured
     const settings = MockDB.getSettings();
     if (settings.supabaseUrl && settings.supabaseKey) {
         try {
@@ -764,13 +744,11 @@ const AuthScreen = ({ onLogin }: { onLogin: (user: UserAccount) => void }) => {
         }
     }
 
-    // 2. Fallback to Local
     if (!user) {
         const localUsers = MockDB.getUsers();
         user = localUsers.find(u => u.username === usr && u.password === pwd) || null;
     }
 
-    // 3. Process Result
     if (!user) {
         if (!isAuto) setError('用户名或密码错误 (或网络连接失败)');
         if (isAuto) setIsAutoLoggingIn(false);
@@ -781,7 +759,6 @@ const AuthScreen = ({ onLogin }: { onLogin: (user: UserAccount) => void }) => {
         if (!isAuto) setError('您的账号已被拒绝。');
         if (isAuto) setIsAutoLoggingIn(false);
     } else {
-        // ALWAYS save for persistence unless explicit logout
         if (!isAuto) {
             MockDB.saveRememberedUser(usr, pwd);
         }
@@ -817,11 +794,9 @@ const AuthScreen = ({ onLogin }: { onLogin: (user: UserAccount) => void }) => {
         
         const settings = MockDB.getSettings();
         try {
-             // Register to Supabase if available
              if (settings.supabaseUrl && settings.supabaseKey) {
                  await SupabaseService.registerUser(newUser);
              } else {
-                 // Register Local
                  const localUsers = MockDB.getUsers();
                  if (localUsers.find(u => u.username === username)) {
                     setError('用户名已存在');
@@ -889,8 +864,6 @@ const AuthScreen = ({ onLogin }: { onLogin: (user: UserAccount) => void }) => {
     </div>
   );
 };
-
-// --- Batch JSON Generator ---
 
 const BatchJsonGenerator = ({ onDataReady }: { onDataReady?: (data: VideoData[]) => void }) => {
   const [srtFiles, setSrtFiles] = useState<File[]>([]);
@@ -1040,29 +1013,25 @@ const AdminPanel = ({ onClose, onDbUpdate }: { onClose: () => void, onDbUpdate: 
   const [supabaseSaveStatus, setSupabaseSaveStatus] = useState('');
   const [cozeSaveStatus, setCozeSaveStatus] = useState('');
   
-  // Migration State (Videos)
+  // Migration State
   const [migrationData, setMigrationData] = useState<VideoData[] | null>(null);
   const [isMigrating, setIsMigrating] = useState(false);
   const [migrationStatus, setMigrationStatus] = useState('');
   const [migrationResult, setMigrationResult] = useState<'success' | 'error' | null>(null);
   const [showConfirmDialog, setShowConfirmDialog] = useState(false);
   
-  // Migration State (Users)
   const [isUserMigrating, setIsUserMigrating] = useState(false);
   const [userMigrationMsg, setUserMigrationMsg] = useState('');
 
   useEffect(() => {
     fetchUsers();
-  }, [activeTab]); // Refetch when tab changes
+  }, [activeTab]);
 
   const fetchUsers = async () => {
-    // Priority: Cloud -> Local
     let userList: UserAccount[] = [];
     if (settings.supabaseUrl && settings.supabaseKey) {
         userList = await SupabaseService.getUsers();
     } 
-    // If Cloud fails or returns empty, logic implies we rely on what we have, 
-    // but here we just show what is in the active data source or fallback to local if cloud is not config
     if (userList.length === 0 && (!settings.supabaseUrl || !settings.supabaseKey)) {
         userList = MockDB.getUsers();
     }
@@ -1099,7 +1068,7 @@ const AdminPanel = ({ onClose, onDbUpdate }: { onClose: () => void, onDbUpdate: 
     setTimeout(() => { 
         setSupabaseSaveStatus(''); 
         onDbUpdate(); 
-        fetchUsers(); // Refresh users from cloud if newly connected
+        fetchUsers(); 
     }, 2000);
   };
 
@@ -1148,7 +1117,7 @@ const AdminPanel = ({ onClose, onDbUpdate }: { onClose: () => void, onDbUpdate: 
           const localUsers = MockDB.getUsers();
           await SupabaseService.migrateUsers(localUsers);
           setUserMigrationMsg(`成功迁移 ${localUsers.length} 个用户`);
-          fetchUsers(); // Refresh list from cloud
+          fetchUsers(); 
       } catch (e) {
           setUserMigrationMsg('迁移失败');
           console.error(e);
@@ -1203,14 +1172,24 @@ create policy "Enable access for all users" on app_users for all using (true) wi
   `.trim();
 
   return (
-    <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+    <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50"
+         onClick={(e) => {
+           if (e.target === e.currentTarget) {
+             if (!isMigrating && !isUserMigrating) {
+                onClose();
+             }
+           }
+         }}>
       <div className="bg-slate-800 rounded-xl shadow-2xl w-full max-w-4xl border border-slate-700 max-h-[90vh] overflow-hidden flex flex-col">
         <div className="p-6 border-b border-slate-700 flex justify-between items-center">
           <h2 className="text-xl font-bold text-white flex items-center gap-2">
             <span className="text-indigo-400"><Shield className="w-5 h-5" /></span>
             管理后台
           </h2>
-          <button onClick={onClose} className="text-slate-400 hover:text-white"><XCircle className="w-6 h-6" /></button>
+          <button onClick={() => { if(!isMigrating && !isUserMigrating) onClose(); }} 
+            className={`transition ${isMigrating || isUserMigrating ? 'opacity-30 cursor-not-allowed text-slate-500' : 'text-slate-400 hover:text-white'}`}>
+            <XCircle className="w-6 h-6" />
+          </button>
         </div>
 
         <div className="flex border-b border-slate-700 bg-slate-900/50">
@@ -1385,7 +1364,7 @@ create policy "Enable access for all users" on app_users for all using (true) wi
 const App = () => {
   const [currentUser, setCurrentUser] = useState<UserAccount | null>(null);
   const [showAdmin, setShowAdmin] = useState(false);
-  const [videos, setVideos] = useState<VideoData[]>([]); // For local/remote JSON mode
+  const [videos, setVideos] = useState<VideoData[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [isAiSearch, setIsAiSearch] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
@@ -1395,6 +1374,8 @@ const App = () => {
   const [dbMode, setDbMode] = useState<'local' | 'supabase'>('local');
   
   const [activeSegmentIndex, setActiveSegmentIndex] = useState<number>(-1);
+  const [isTranscriptLoading, setIsTranscriptLoading] = useState(false);
+  
   const videoRef = useRef<HTMLVideoElement>(null);
   const transcriptRef = useRef<HTMLDivElement>(null);
 
@@ -1412,7 +1393,12 @@ const App = () => {
     if (activeSegmentIndex !== -1 && transcriptRef.current) {
         setTimeout(() => {
             const child = transcriptRef.current?.children[activeSegmentIndex] as HTMLElement;
-            if (child) child.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            if (child) {
+                child.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                setTimeout(() => setIsTranscriptLoading(false), 800);
+            } else {
+                setIsTranscriptLoading(false);
+            }
         }, 100);
     }
   }, [activeSegmentIndex]);
@@ -1420,12 +1406,9 @@ const App = () => {
   const initData = async () => {
     const settings = MockDB.getSettings();
     
-    // Priority: Supabase > Remote JSON > Local
     if (settings.supabaseUrl && settings.supabaseKey) {
         console.log("Initializing in Supabase Mode");
         setDbMode('supabase');
-        // FIX: Fetch video metadata so Coze AI can map IDs/Titles to objects
-        // We load metadata ONLY (no transcripts) to save bandwidth but enable search matching
         const cloudVideos = await SupabaseService.getAllVideos();
         setVideos(cloudVideos); 
     } else {
@@ -1459,17 +1442,14 @@ const App = () => {
       const settings = MockDB.getSettings();
 
       try {
-          // 1. AI Search (Coze) - Takes precedence if toggled
           if (isAiSearch) {
               const results = await cozeSearch(searchQuery, settings, videos);
               setSearchResults(results);
           } 
-          // 2. Supabase Search (Plan B)
           else if (dbMode === 'supabase') {
               const results = await SupabaseService.search(searchQuery);
               setSearchResults(results);
           } 
-          // 3. Local/Remote JSON Search (Plan A)
           else {
               const results = fallbackSearch(searchQuery, videos);
               setSearchResults(results);
@@ -1497,60 +1477,41 @@ const App = () => {
       const file = e.target.files?.[0];
       if (file && selectedVideo) {
            const url = URL.createObjectURL(file);
-           
-           // FIX: Always update the global videos cache with the new dataUrl, 
-           // regardless of dbMode. This ensures search results can 'find' the loaded file.
            setVideos(prev => prev.map(v => v.id === selectedVideo.id ? { ...v, dataUrl: url } : v));
-           
-           // Update current selection reference to play immediately
            setSelectedVideo(prev => prev ? { ...prev, dataUrl: url } : null);
       }
   };
   
   const handleSearchResultClick = async (result: SearchResult) => {
+      setIsTranscriptLoading(true);
       let targetVideo = result.video;
 
-      // --- FIX 1: Merge with existing state to preserve DataURL (Local File) ---
-      // When searching, we get a "fresh" video object from DB/Search that lacks the local blob URL.
-      // We must check if we already have a version of this video loaded in memory.
       const cachedVideo = videos.find(v => v.id === targetVideo.id);
       
       if (cachedVideo) {
-          // Preserve the local file URL if user already uploaded it
           if (cachedVideo.dataUrl) {
               targetVideo.dataUrl = cachedVideo.dataUrl;
           }
-          // If the search result has no transcript (e.g. metadata only), but cache does, use cache
           if ((!targetVideo.transcript || targetVideo.transcript.length === 0) && cachedVideo.transcript && cachedVideo.transcript.length > 0) {
               targetVideo.transcript = cachedVideo.transcript;
           }
       }
 
-      // --- FIX 2: Check current selected video as well (Redundancy) ---
       if (selectedVideo && selectedVideo.id === targetVideo.id && selectedVideo.dataUrl && !targetVideo.dataUrl) {
            targetVideo.dataUrl = selectedVideo.dataUrl;
       }
 
-      // If using Supabase, we might not have the full transcript yet
       if (dbMode === 'supabase' && (!targetVideo.transcript || targetVideo.transcript.length === 0)) {
-           // Fetch full transcript on demand
            const fullTranscript = await SupabaseService.fetchTranscript(targetVideo.id);
            targetVideo.transcript = fullTranscript;
-           
-           // Update cache so we don't fetch again
            setVideos(prev => prev.map(v => v.id === targetVideo.id ? { ...v, transcript: fullTranscript } : v));
       }
 
       setSelectedVideo({ ...targetVideo });
       
-      // --- FIX 3: Robust Index Finding (Fuzzy Match) ---
-      // Sometimes seconds differ slightly between systems (0.5s diff), causing findIndex to fail with strict equality
       let index = -1;
       if (targetVideo.transcript && targetVideo.transcript.length > 0) {
-          // A. Try exact match
           index = targetVideo.transcript.findIndex(t => t.startTime === result.segment.startTime);
-          
-          // B. Try fuzzy match (within 1 second)
           if (index === -1) {
               index = targetVideo.transcript.findIndex(t => Math.abs(t.seconds - result.segment.seconds) < 1.0);
           }
@@ -1558,7 +1519,6 @@ const App = () => {
 
       if (index !== -1) setActiveSegmentIndex(index);
       
-      // Delay seek slightly to ensure video element is ready/mounted with new source
       setTimeout(() => handleSeek(result.segment.seconds), 100);
   };
 
@@ -1598,7 +1558,6 @@ const App = () => {
 
       <main className="flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 overflow-hidden">
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 h-full">
-          {/* Search Column - Independently scrollable */}
           <div className="lg:col-span-1 flex flex-col h-full min-h-0 gap-4">
             <div className="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg flex-shrink-0">
               <div className="flex justify-between items-center mb-4">
@@ -1621,6 +1580,14 @@ const App = () => {
                     className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white px-5 rounded-lg font-medium transition flex items-center justify-center h-full">
                     搜索
                 </button>
+              </div>
+              
+              <div className="mt-3 text-xs text-slate-500 flex items-start gap-1.5 leading-relaxed">
+                  <span className="text-indigo-400 font-bold flex-shrink-0 flex items-center gap-1"><Info className="w-3 h-3"/> 小提示：</span>
+                  <span>
+                    您可以输入多个关键词，中间用空格分割，比如：
+                    <span className="text-indigo-200 font-bold bg-indigo-500/20 px-1 py-0.5 rounded mx-1">未来十年 确定性 普通人 机会</span>
+                  </span>
               </div>
             </div>
 
@@ -1658,7 +1625,6 @@ const App = () => {
             </div>
           </div>
 
-          {/* Player Column - Independently scrollable transcript */}
           <div className="lg:col-span-2 h-full min-h-0 flex flex-col">
             <div className="bg-slate-900 rounded-xl overflow-hidden shadow-2xl border border-slate-800 flex flex-col h-full">
                 <div className="bg-black relative flex items-center justify-center border-b border-slate-800 flex-shrink-0 h-[40%] min-h-[200px]">
@@ -1693,6 +1659,15 @@ const App = () => {
                      <Files className="w-3 h-3" /> 全文记录
                   </div>
                   
+                  {isTranscriptLoading && (
+                    <div className="absolute inset-0 z-50 bg-slate-900/80 backdrop-blur-sm flex items-center justify-center animate-in fade-in duration-200">
+                        <div className="flex flex-col items-center gap-2 bg-slate-800 p-4 rounded-xl border border-slate-700 shadow-xl">
+                            <Loader2 className="w-8 h-8 text-indigo-500 animate-spin" />
+                            <span className="text-sm text-indigo-300 font-medium">正在定位...</span>
+                        </div>
+                    </div>
+                  )}
+
                   <div ref={transcriptRef} className="flex-1 overflow-y-auto p-4 space-y-3 custom-scrollbar scroll-smooth">
                     {selectedVideo?.transcript?.map((t, i) => (
                       <div key={i} onClick={() => { setActiveSegmentIndex(i); if (selectedVideo.dataUrl || selectedVideo.publicUrl) handleSeek(t.seconds); }}
