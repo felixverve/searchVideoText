@@ -23,9 +23,7 @@ import {
   Trash2,
   Globe,
   Flag,
-  BookOpen,
-  Edit3,
-  Save
+  BookOpen
 } from 'lucide-react';
 
 // --- Types ---
