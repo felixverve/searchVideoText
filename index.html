@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>StreamSearch</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <!-- 直接加载 Supabase 全局脚本，避免 import 解析错误 -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script type="importmap">
   {
     "imports": {
@@ -12,7 +14,8 @@
       "react/": "https://aistudiocdn.com/react@^19.2.0/",
       "react": "https://aistudiocdn.com/react@^19.2.0",
       "react-dom/": "https://aistudiocdn.com/react-dom@^19.2.0/",
-      "lucide-react": "https://aistudiocdn.com/lucide-react@^0.555.0"
+      "lucide-react": "https://aistudiocdn.com/lucide-react@^0.555.0",
+      "@supabase/supabase-js": "https://aistudiocdn.com/@supabase/supabase-js@^2.86.2"
     }
   }
   </script>

@@ -1,4 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { createRoot } from 'react-dom/client';
+import { createClient } from '@supabase/supabase-js';
+
 import { 
   Search, 
   Play, 
@@ -23,7 +26,9 @@ import {
   Trash2,
   Globe,
   Flag,
-  BookOpen
+  BookOpen,
+  Check,
+  Users
 } from 'lucide-react';
 
 // --- Types ---
@@ -37,14 +42,14 @@ interface UserAccount {
   password: string; // In a real app, this would be hashed!
   role: UserRole;
   status: UserStatus;
-  note?: string; // New field for admin notes
+  note?: string; 
 }
 
 interface TranscriptSegment {
-  startTime: string; // Format "MM:SS"
+  startTime: string; 
   endTime: string;
   text: string;
-  seconds: number; // Pre-calculated start seconds for seeking
+  seconds: number; 
 }
 
 interface VideoData {
@@ -53,18 +58,20 @@ interface VideoData {
   fileName: string;
   uploadDate: string;
   transcript: TranscriptSegment[];
-  publicUrl?: string; // If hosted externally
-  dataUrl?: string; // If local blob (session only)
+  publicUrl?: string; 
+  dataUrl?: string; 
 }
 
 interface AppSettings {
-  remoteDatabaseUrl: string; // URL to a JSON file hosted elsewhere (e.g. GitHub Gist)
-  cozeApiKey: string;        // PAT (Personal Access Token) for Coze
-  cozeBotId: string;         // The Bot ID configured in Coze
-  cozeBaseUrl: string;       // API Endpoint (cn or com)
+  remoteDatabaseUrl: string; 
+  cozeApiKey: string;        
+  cozeBotId: string;         
+  cozeBaseUrl: string;       
+  // New Supabase Config
+  supabaseUrl: string;
+  supabaseKey: string;
 }
 
-// Result structure for Search
 interface SearchResult {
   video: VideoData;
   segment: TranscriptSegment;
@@ -78,12 +85,11 @@ const DB_KEYS = {
   USERS: 'app_users',
   SETTINGS: 'app_settings',
   LOCAL_VIDEOS: 'app_local_videos',
-  AUTH_REMEMBER: 'app_auth_remember' // New key for remember me
+  AUTH_REMEMBER: 'app_auth_remember' 
 };
 
 const MockDB = {
   init: () => {
-    // 1. Initialize Users
     if (!localStorage.getItem(DB_KEYS.USERS)) {
       const defaultAdmin: UserAccount = {
         id: 'admin-1',
@@ -96,13 +102,14 @@ const MockDB = {
       localStorage.setItem(DB_KEYS.USERS, JSON.stringify([defaultAdmin]));
     }
     
-    // 2. Initialize Settings
     if (!localStorage.getItem(DB_KEYS.SETTINGS)) {
       const defaultSettings: AppSettings = {
         remoteDatabaseUrl: '',
         cozeApiKey: '',
         cozeBotId: '',
-        cozeBaseUrl: 'https://api.coze.cn' // Default to China for better compat
+        cozeBaseUrl: 'https://api.coze.cn',
+        supabaseUrl: '',
+        supabaseKey: ''
       };
       localStorage.setItem(DB_KEYS.SETTINGS, JSON.stringify(defaultSettings));
     }
@@ -114,7 +121,6 @@ const MockDB = {
 
   saveUser: (user: UserAccount) => {
     const users = MockDB.getUsers();
-    // Check if update or new
     const idx = users.findIndex(u => u.id === user.id);
     if (idx >= 0) {
         users[idx] = user;
@@ -141,7 +147,9 @@ const MockDB = {
         remoteDatabaseUrl: '', 
         cozeApiKey: '', 
         cozeBotId: '',
-        cozeBaseUrl: 'https://api.coze.cn'
+        cozeBaseUrl: 'https://api.coze.cn',
+        supabaseUrl: '',
+        supabaseKey: ''
     };
     const stored = JSON.parse(localStorage.getItem(DB_KEYS.SETTINGS) || '{}');
     return { ...defaults, ...stored };
@@ -161,11 +169,10 @@ const MockDB = {
     try {
       localStorage.setItem(DB_KEYS.LOCAL_VIDEOS, JSON.stringify(videos));
     } catch (e) {
-      alert("本地存储已满！无法保存更多本地视频。");
+      console.error("本地存储已满！无法保存更多本地视频。", e);
     }
   },
 
-  // Remember Me Logic
   getRememberedUser: () => {
     const data = localStorage.getItem(DB_KEYS.AUTH_REMEMBER);
     return data ? JSON.parse(data) : null;
@@ -243,7 +250,179 @@ const parseSubtitleFile = (content: string): TranscriptSegment[] => {
   return segments;
 };
 
-// --- Coze Service (Simulation/Real) ---
+// --- Supabase Service (Plan B) ---
+
+const SupabaseService = {
+    getClient: () => {
+        const settings = MockDB.getSettings();
+        if (!settings.supabaseUrl || !settings.supabaseKey) return null;
+        return createClient(settings.supabaseUrl, settings.supabaseKey);
+    },
+
+    // --- Video & Transcript Logic ---
+    search: async (query: string): Promise<SearchResult[]> => {
+        const supabase = SupabaseService.getClient();
+        if (!supabase) return [];
+        
+        const keywords = query.trim().split(/\s+/);
+        if (keywords.length === 0) return [];
+        
+        const { data, error } = await supabase
+            .from('transcripts')
+            .select(`*, videos (id, title, file_name, upload_date, public_url)`)
+            .ilike('text', `%${keywords[0]}%`)
+            .limit(50);
+
+        if (error) { console.error("Supabase Search Error:", error); throw error; }
+        if (!data) return [];
+
+        const filtered = data.filter((item: any) => {
+             const text = item.text.toLowerCase();
+             return keywords.every(k => text.includes(k.toLowerCase()));
+        });
+
+        return filtered.map((item: any) => ({
+            video: {
+                id: item.videos.id,
+                title: item.videos.title,
+                fileName: item.videos.file_name,
+                uploadDate: item.videos.upload_date,
+                publicUrl: item.videos.public_url,
+                transcript: [], 
+            },
+            segment: {
+                startTime: item.start_time,
+                endTime: item.end_time,
+                text: item.text,
+                seconds: item.seconds
+            }
+        }));
+    },
+
+    fetchTranscript: async (videoId: string): Promise<TranscriptSegment[]> => {
+        const supabase = SupabaseService.getClient();
+        if (!supabase) return [];
+
+        const { data, error } = await supabase
+            .from('transcripts')
+            .select('*')
+            .eq('video_id', videoId)
+            .order('seconds', { ascending: true });
+            
+        if (error) return [];
+        return data.map((item: any) => ({
+            startTime: item.start_time,
+            endTime: item.end_time,
+            text: item.text,
+            seconds: item.seconds
+        }));
+    },
+    
+    uploadData: async (videos: VideoData[], onProgress: (msg: string) => void) => {
+        const supabase = SupabaseService.getClient();
+        if (!supabase) throw new Error("Supabase 未配置");
+
+        for (let i = 0; i < videos.length; i++) {
+            const v = videos[i];
+            onProgress(`正在上传视频 (${i + 1}/${videos.length}): ${v.title}`);
+            const { error: vError } = await supabase.from('videos').upsert({
+                id: v.id,
+                title: v.title,
+                file_name: v.fileName,
+                upload_date: v.uploadDate,
+                public_url: v.publicUrl || null
+            });
+            if (vError) throw new Error(`上传视频 ${v.title} 失败: ${vError.message}`);
+
+            const transcriptRows = v.transcript.map(t => ({
+                video_id: v.id,
+                start_time: t.startTime,
+                end_time: t.endTime,
+                text: t.text,
+                seconds: t.seconds
+            }));
+            const chunkSize = 1000;
+            for (let j = 0; j < transcriptRows.length; j += chunkSize) {
+                const chunk = transcriptRows.slice(j, j + chunkSize);
+                const { error: tError } = await supabase.from('transcripts').insert(chunk);
+                if (tError) throw new Error(`上传字幕失败: ${tError.message}`);
+            }
+        }
+        onProgress("上传完成！");
+    },
+
+    // --- User Management Logic ---
+
+    getUsers: async (): Promise<UserAccount[]> => {
+        const supabase = SupabaseService.getClient();
+        if (!supabase) return [];
+        const { data, error } = await supabase.from('app_users').select('*').order('username');
+        if (error) { console.error("Fetch Users Error", error); return []; }
+        return data as UserAccount[];
+    },
+
+    loginUser: async (username: string, password: string): Promise<UserAccount | null> => {
+        const supabase = SupabaseService.getClient();
+        if (!supabase) return null;
+        // WARNING: In production, password checking should be done securely (e.g. hashing)
+        const { data, error } = await supabase
+            .from('app_users')
+            .select('*')
+            .eq('username', username)
+            .eq('password', password) // Basic comparison
+            .single();
+        
+        if (error || !data) return null;
+        return data as UserAccount;
+    },
+
+    registerUser: async (user: UserAccount): Promise<void> => {
+        const supabase = SupabaseService.getClient();
+        if (!supabase) throw new Error("DB not connected");
+        
+        const { error } = await supabase.from('app_users').insert({
+            id: user.id,
+            username: user.username,
+            password: user.password,
+            role: user.role,
+            status: user.status,
+            note: user.note
+        });
+        if (error) throw error;
+    },
+
+    updateUserStatus: async (userId: string, status: UserStatus): Promise<void> => {
+        const supabase = SupabaseService.getClient();
+        if (!supabase) return;
+        await supabase.from('app_users').update({ status }).eq('id', userId);
+    },
+
+    updateUserNote: async (userId: string, note: string): Promise<void> => {
+        const supabase = SupabaseService.getClient();
+        if (!supabase) return;
+        await supabase.from('app_users').update({ note }).eq('id', userId);
+    },
+
+    migrateUsers: async (users: UserAccount[]): Promise<void> => {
+        const supabase = SupabaseService.getClient();
+        if (!supabase) throw new Error("DB not connected");
+        
+        // Remove admin-1 duplicate if exists in cloud (or upsert)
+        for (const u of users) {
+             const { error } = await supabase.from('app_users').upsert({
+                id: u.id,
+                username: u.username,
+                password: u.password,
+                role: u.role,
+                status: u.status,
+                note: u.note
+             });
+             if (error) console.warn("Failed to migrate user " + u.username, error);
+        }
+    }
+};
+
+// --- Coze Service ---
 
 const cozeSearch = async (
   query: string, 
@@ -258,11 +437,8 @@ const cozeSearch = async (
   }
 
   // 2. Real API Call
-  // Determine endpoint based on settings, default to CN if not set or explicit
   const baseUrl = settings.cozeBaseUrl || 'https://api.coze.cn';
   const endpoint = `${baseUrl}/open_api/v2/chat`;
-
-  console.log(`Connecting to Coze API: ${endpoint}`);
 
   try {
     const response = await fetch(endpoint, {
@@ -281,46 +457,30 @@ const cozeSearch = async (
     });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`Coze API Error (${response.status}):`, errorText);
-      throw new Error(`Coze API Error: ${response.status} - ${errorText}`);
+      throw new Error(`Coze API Error: ${response.status}`);
     }
 
     const data = await response.json();
-    console.log("Coze Response Data:", data);
     
     if (data.code !== 0) {
-        console.error("Coze API returned logical error:", data.msg);
         let friendlyMsg = data.msg;
-        // Detect "not published" error
         if (typeof data.msg === 'string' && (data.msg.includes('not been published') || data.msg.includes('Agent As API'))) {
-            friendlyMsg = "Bot 未发布到 'Agent as API' 渠道。\n请前往 Coze 平台 → 发布 → 勾选 'Agent as API' → 点击发布。";
+            friendlyMsg = "Bot 未发布到 'Agent as API' 渠道。";
         }
         throw new Error(friendlyMsg);
     }
 
     const messages = data.messages || [];
-    // Find the last 'answer' message
     const answerMessage = [...messages].reverse().find((m: any) => m.type === 'answer');
     
     if (answerMessage) {
-       try {
          const content = answerMessage.content;
-         console.log("Coze Raw Answer:", content);
-
-         // Check for "No Knowledge Base" specific error in content
-         if (content.includes('没有提供') && (content.includes('知识库') || content.includes('knowledge base'))) {
-             throw new Error("Coze Bot 未关联知识库。\n请前往 Coze 平台 → 创建知识库并上传数据 → 在 Bot 中添加该知识库 → 重新发布。");
-         }
-
-         // Try to extract JSON from markdown block ```json ... ``` or just [...]
+         // Try to extract JSON
          let jsonString = '';
-         
          const markdownMatch = content.match(/```json\s*([\s\S]*?)\s*```/);
          if (markdownMatch) {
              jsonString = markdownMatch[1];
          } else {
-             // Try to find the first [ and last ]
              const start = content.indexOf('[');
              const end = content.lastIndexOf(']');
              if (start !== -1 && end !== -1 && end > start) {
@@ -330,21 +490,18 @@ const cozeSearch = async (
 
          if (jsonString) {
            const parsed = JSON.parse(jsonString);
-           // Map back to local video data
            const mappedResults: SearchResult[] = [];
            
+           // Note: Coze search only searches local videos array currently. 
+           // If using Supabase, Coze needs its own Knowledge Base updated separately.
            parsed.forEach((item: any) => {
-             // Find video by partial ID match or Title match (case insensitive)
              const vid = localVideos.find(v => 
                v.id === item.videoId || 
-               v.title.toLowerCase().includes((item.videoId || '').toLowerCase()) ||
-               v.fileName.toLowerCase().includes((item.videoId || '').toLowerCase())
+               v.title.toLowerCase().includes((item.videoId || '').toLowerCase())
              );
              
              if (vid) {
-               // Find closest segment
                const seconds = timeToSeconds(item.timestamp || "00:00:00");
-               // Find segment closest to this time
                let closestSegment = vid.transcript[0];
                let minDiff = Infinity;
                
@@ -365,40 +522,24 @@ const cozeSearch = async (
              }
            });
            return mappedResults;
-         } else {
-           console.warn("No JSON array found in Coze response text:", content);
-           // Fallback for empty array response which is valid JSON but empty result
-           if (jsonString === '[]') return [];
          }
-       } catch (e) {
-         console.error("Failed to parse Coze JSON response", e);
-         if (e instanceof Error && e.message.includes('未关联知识库')) {
-             throw e; // Propagate specific knowledge base error
-         }
-       }
     }
-    
     return [];
-
   } catch (error) {
     console.error("Coze Fetch Failed", error);
-    alert(`AI 搜索请求失败:\n${error instanceof Error ? error.message : '未知错误'}`);
     return []; 
   }
 };
 
 const fallbackSearch = (query: string, localVideos: VideoData[]): SearchResult[] => {
-    // New Logic for Fallback (Video-level AND)
     const keywords = query.toLowerCase().split(/\s+/);
     const results: SearchResult[] = [];
     
     localVideos.forEach(video => {
-      // 1. Check video level match first (Video contains ALL keywords)
       const fullText = video.transcript.map(t => t.text).join(' ').toLowerCase();
       const isVideoMatch = keywords.every(k => fullText.includes(k));
 
       if (isVideoMatch) {
-          // 2. If video matches, return segments that contain ANY of the keywords
           video.transcript.forEach(segment => {
             const text = segment.text.toLowerCase();
             if (keywords.some(k => text.includes(k))) {
@@ -426,69 +567,91 @@ const AuthScreen = ({ onLogin }: { onLogin: (user: UserAccount) => void }) => {
   const [success, setSuccess] = useState('');
   const [isAutoLoggingIn, setIsAutoLoggingIn] = useState(true);
 
+  // Check login logic: Local vs Cloud
+  const attemptLogin = async (usr: string, pwd: string, isAuto: boolean) => {
+    let user: UserAccount | null = null;
+    
+    // 1. Try Supabase First if configured
+    const settings = MockDB.getSettings();
+    if (settings.supabaseUrl && settings.supabaseKey) {
+        try {
+            user = await SupabaseService.loginUser(usr, pwd);
+        } catch (e) {
+            console.error("Supabase Login Error", e);
+        }
+    }
+
+    // 2. Fallback to Local
+    if (!user) {
+        const localUsers = MockDB.getUsers();
+        user = localUsers.find(u => u.username === usr && u.password === pwd) || null;
+    }
+
+    // 3. Process Result
+    if (!user) {
+        if (!isAuto) setError('用户名或密码错误 (或网络连接失败)');
+        if (isAuto) setIsAutoLoggingIn(false);
+    } else if (user.status === 'pending') {
+        if (!isAuto) setError('账号审核中，请联系管理员。');
+        if (isAuto) setIsAutoLoggingIn(false);
+    } else if (user.status === 'rejected') {
+        if (!isAuto) setError('您的账号已被拒绝。');
+        if (isAuto) setIsAutoLoggingIn(false);
+    } else {
+        if (!isAuto && rememberMe) MockDB.saveRememberedUser(usr, pwd);
+        if (!isAuto && !rememberMe) MockDB.clearRememberedUser();
+        onLogin(user);
+    }
+  };
+
   useEffect(() => {
-    // Check for remembered user and auto-login if possible
     const saved = MockDB.getRememberedUser();
     if (saved) {
       setUsername(saved.username);
       setPassword(saved.password);
       setRememberMe(true);
-      
-      // Attempt auto-login
-      const users = MockDB.getUsers();
-      const user = users.find(u => u.username === saved.username && u.password === saved.password);
-      
-      if (user && user.status === 'active') {
-          // Small delay for UX transition
-          setTimeout(() => {
-              onLogin(user);
-          }, 800);
-      } else {
-          setIsAutoLoggingIn(false); // Stop loader if auth failed or status pending
-      }
+      attemptLogin(saved.username, saved.password, true);
     } else {
         setIsAutoLoggingIn(false);
     }
   }, []);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
     setSuccess('');
-    const users = MockDB.getUsers();
-
+    
     if (isRegister) {
-      if (users.find(u => u.username === username)) {
-        setError('用户名已存在');
-        return;
-      }
-      const newUser: UserAccount = {
-        id: Date.now().toString(),
-        username,
-        password,
-        role: 'user',
-        status: 'pending',
-        note: ''
-      };
-      MockDB.saveUser(newUser);
-      setSuccess('注册成功！请等待管理员审核。');
-      setIsRegister(false);
-    } else {
-      const user = users.find(u => u.username === username && u.password === password);
-      if (!user) {
-        setError('用户名或密码错误');
-      } else if (user.status === 'pending') {
-        setError('账号审核中，请联系管理员。');
-      } else if (user.status === 'rejected') {
-        setError('您的账号已被拒绝。');
-      } else {
-        if (rememberMe) {
-          MockDB.saveRememberedUser(username, password);
-        } else {
-          MockDB.clearRememberedUser();
+        const newUser: UserAccount = {
+            id: 'u_' + Date.now().toString(),
+            username,
+            password,
+            role: 'user',
+            status: 'pending',
+            note: ''
+        };
+        
+        const settings = MockDB.getSettings();
+        try {
+             // Register to Supabase if available
+             if (settings.supabaseUrl && settings.supabaseKey) {
+                 await SupabaseService.registerUser(newUser);
+             } else {
+                 // Register Local
+                 const localUsers = MockDB.getUsers();
+                 if (localUsers.find(u => u.username === username)) {
+                    setError('用户名已存在');
+                    return;
+                 }
+                 MockDB.saveUser(newUser);
+             }
+             setSuccess('注册成功！请等待管理员审核。');
+             setIsRegister(false);
+        } catch (e) {
+             setError('注册失败: ' + (e instanceof Error ? e.message : '未知错误'));
         }
-        onLogin(user);
-      }
+    } else {
+        attemptLogin(username, password, false);
     }
   };
 
@@ -512,57 +675,36 @@ const AuthScreen = ({ onLogin }: { onLogin: (user: UserAccount) => void }) => {
         <h2 className="text-2xl font-bold text-white text-center mb-6">
           {isRegister ? '申请访问权限' : '安全登录'}
         </h2>
-        
         {error && <div className="bg-red-500/20 text-red-200 p-3 rounded mb-4 text-sm">{error}</div>}
         {success && <div className="bg-green-500/20 text-green-200 p-3 rounded mb-4 text-sm">{success}</div>}
-
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
             <label className="block text-slate-400 text-sm mb-1">用户名</label>
             <input 
-              type="text" 
-              required
-              className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white focus:outline-none focus:border-indigo-500"
-              value={username}
-              onChange={e => setUsername(e.target.value)}
+              type="text" required className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white"
+              value={username} onChange={e => setUsername(e.target.value)}
             />
           </div>
           <div>
             <label className="block text-slate-400 text-sm mb-1">密码</label>
             <input 
-              type="password" 
-              required
-              className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white focus:outline-none focus:border-indigo-500"
-              value={password}
-              onChange={e => setPassword(e.target.value)}
+              type="password" required className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white"
+              value={password} onChange={e => setPassword(e.target.value)}
             />
           </div>
-          
           {!isRegister && (
             <div className="flex items-center">
-              <input
-                id="remember_me"
-                type="checkbox"
-                className="w-4 h-4 text-indigo-600 bg-slate-700 border-slate-600 rounded focus:ring-indigo-600 focus:ring-2"
-                checked={rememberMe}
-                onChange={e => setRememberMe(e.target.checked)}
-              />
-              <label htmlFor="remember_me" className="ml-2 text-sm text-slate-400">
-                记住账号密码
-              </label>
+              <input id="remember_me" type="checkbox" className="w-4 h-4 text-indigo-600 bg-slate-700 border-slate-600 rounded"
+                checked={rememberMe} onChange={e => setRememberMe(e.target.checked)} />
+              <label htmlFor="remember_me" className="ml-2 text-sm text-slate-400">记住账号密码</label>
             </div>
           )}
-
           <button type="submit" className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-2 rounded transition">
             {isRegister ? '注册' : '登录'}
           </button>
         </form>
-        
         <div className="mt-4 text-center">
-          <button 
-            onClick={() => setIsRegister(!isRegister)}
-            className="text-indigo-400 text-sm hover:underline"
-          >
+          <button onClick={() => setIsRegister(!isRegister)} className="text-indigo-400 text-sm hover:underline">
             {isRegister ? '已有账号？去登录' : '没有账号？去注册'}
           </button>
         </div>
@@ -573,7 +715,7 @@ const AuthScreen = ({ onLogin }: { onLogin: (user: UserAccount) => void }) => {
 
 // --- Batch JSON Generator ---
 
-const BatchJsonGenerator = () => {
+const BatchJsonGenerator = ({ onDataReady }: { onDataReady?: (data: VideoData[]) => void }) => {
   const [srtFiles, setSrtFiles] = useState<File[]>([]);
   const [generatedJson, setGeneratedJson] = useState('');
   const [status, setStatus] = useState('');
@@ -584,55 +726,41 @@ const BatchJsonGenerator = () => {
 
   const handleProcessFiles = async () => {
     if (srtFiles.length === 0) return;
-
     setIsProcessing(true);
     setProgress(0);
     setStatus('正在初始化批量解析...');
     
-    // Use setTimeout to allow UI to render start state
     setTimeout(async () => {
         try {
           const processedVideos: VideoData[] = [];
           const total = srtFiles.length;
 
-          // Process in chunks to avoid blocking UI
           for (let i = 0; i < total; i++) {
             const file = srtFiles[i];
-            
-            // Update UI every 5 files or on last file
             if (i % 5 === 0 || i === total - 1) {
                 setProgress(Math.round(((i + 1) / total) * 100));
                 setStatus(`正在解析 (${i + 1}/${total}): ${file.name}`);
-                // Yield to main thread
                 await new Promise(r => setTimeout(r, 0));
             }
-
             try {
                 const text = await fileToText(file);
                 const transcript = parseSubtitleFile(text);
                 const fileNameWithoutExt = file.name.replace(/\.[^/.]+$/, "");
-                
                 processedVideos.push({
-                id: `vid_${Date.now()}_${Math.random().toString(36).substr(2, 5)}_${i}`,
-                title: fileNameWithoutExt, 
-                fileName: fileNameWithoutExt + '.mp4', 
-                uploadDate: new Date().toISOString().split('T')[0],
-                transcript: transcript
+                  id: `vid_${Date.now()}_${Math.random().toString(36).substr(2, 5)}_${i}`,
+                  title: fileNameWithoutExt, 
+                  fileName: fileNameWithoutExt + '.mp4', 
+                  uploadDate: new Date().toISOString().split('T')[0],
+                  transcript: transcript
                 });
-            } catch (err) {
-                console.error(`Error parsing file ${file.name}`, err);
-            }
+            } catch (err) { console.error(err); }
           }
-
-          setGeneratedJson(JSON.stringify(processedVideos, null, 2));
+          const jsonStr = JSON.stringify(processedVideos, null, 2);
+          setGeneratedJson(jsonStr);
+          if (onDataReady) onDataReady(processedVideos);
           setStatus(`大功告成！成功解析 ${processedVideos.length} / ${total} 个文件。`);
-        } catch (e) {
-          console.error(e);
-          setStatus('批量处理时发生意外错误。');
-        } finally {
-          setIsProcessing(false);
-          setProgress(100);
-        }
+        } catch (e) { setStatus('批量处理时发生意外错误。'); } 
+        finally { setIsProcessing(false); setProgress(100); }
     }, 100);
   };
 
@@ -651,158 +779,78 @@ const BatchJsonGenerator = () => {
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    setStatus('数据库文件下载已开始。');
-  };
-
-  const handleDragOver = (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(true);
-  };
-
-  const handleDragLeave = () => {
-    setIsDragging(false);
   };
 
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(false);
-    
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-       const newFiles = Array.from(e.dataTransfer.files).filter(file => {
-         const ext = file.name.split('.').pop()?.toLowerCase();
-         return ['srt', 'vtt', 'txt'].includes(ext || '');
-       });
-       
+    if (e.dataTransfer.files?.length > 0) {
+       const newFiles = Array.from(e.dataTransfer.files).filter(f => ['srt', 'vtt', 'txt'].includes(f.name.split('.').pop()?.toLowerCase() || ''));
        if (newFiles.length > 0) {
          setSrtFiles(prev => [...prev, ...newFiles]);
          setStatus(`已添加 ${newFiles.length} 个文件，准备生成。`);
-       } else {
-         setStatus("未检测到有效的字幕文件 (.srt, .vtt, .txt)");
        }
     }
   };
 
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files.length > 0) {
-        const newFiles = Array.from(e.target.files);
-        setSrtFiles(prev => [...prev, ...newFiles]);
-        setStatus(`已添加 ${newFiles.length} 个文件，准备生成。`);
-    }
-  };
-
-  const clearFiles = () => {
-      setSrtFiles([]);
-      setGeneratedJson('');
-      setStatus('');
-      setProgress(0);
-  };
-
   return (
     <div className="bg-slate-900 p-4 rounded-lg border border-slate-700 space-y-4">
-      <div className="text-sm text-slate-400 mb-2">
-        <p>批量上传工具：一次性拖拽多个 SRT 文件，自动生成包含所有视频数据的单一 JSON 文件。</p>
-      </div>
-      
       <div>
-        <label className="block text-xs text-slate-400 mb-1">拖拽文件到下方 (支持多选)</label>
+        <label className="block text-xs text-slate-400 mb-1">1. 拖拽文件生成数据 (支持多选)</label>
         <div 
-            onDragOver={handleDragOver}
-            onDragLeave={handleDragLeave}
+            onDragOver={e => {e.preventDefault(); setIsDragging(true);}}
+            onDragLeave={() => setIsDragging(false)}
             onDrop={handleDrop}
             onClick={() => fileInputRef.current?.click()}
             className={`
-              border-2 border-dashed rounded-lg p-8 text-center cursor-pointer transition-all duration-200 relative
-              ${isDragging 
-                ? 'border-indigo-500 bg-indigo-500/10 scale-[0.99]' 
-                : 'border-slate-700 hover:border-indigo-500/50 hover:bg-slate-800/50'
-              }
+              border-2 border-dashed rounded-lg p-6 text-center cursor-pointer transition-all relative
+              ${isDragging ? 'border-indigo-500 bg-indigo-500/10' : 'border-slate-700 hover:border-indigo-500/50'}
             `}
         >
-          <input 
-            type="file" 
-            ref={fileInputRef}
-            accept=".srt,.vtt,.txt"
-            multiple // ENABLE MULTIPLE SELECTION
-            onChange={handleFileSelect}
-            className="hidden"
-          />
-          <div className="flex flex-col items-center gap-3">
-             <div className={`p-3 rounded-full ${isDragging ? 'bg-indigo-500/20' : 'bg-slate-800'}`}>
-                {srtFiles.length > 0 ? <span className="text-indigo-400"><Files className="w-6 h-6" /></span> : <span className="text-slate-400"><Upload className="w-6 h-6" /></span>}
-             </div>
-             <div>
-                {srtFiles.length > 0 ? (
-                   <div className="text-center">
-                       <p className="text-sm font-medium text-indigo-300">已添加 {srtFiles.length} 个文件</p>
-                       <p className="text-xs text-slate-500 mt-1">点击生成按钮开始处理</p>
-                   </div>
-                ) : (
-                   <>
-                     <p className="text-sm text-slate-300 font-medium">点击此处或拖拽多个文件上传</p>
-                     <p className="text-xs text-slate-500 mt-1">支持 .srt, .vtt, .txt (系统自动使用文件名作为标题)</p>
-                   </>
-                )}
-             </div>
+          <input type="file" ref={fileInputRef} accept=".srt,.vtt,.txt" multiple onChange={e => {
+              if (e.target.files?.length) {
+                  setSrtFiles(prev => [...prev, ...Array.from(e.target.files!)]);
+                  setStatus(`已添加 ${e.target.files!.length} 个文件。`);
+              }
+          }} className="hidden" />
+          <div className="flex flex-col items-center gap-2">
+             <div className="p-2 bg-slate-800 rounded-full text-slate-400"><Upload className="w-5 h-5" /></div>
+             <p className="text-xs text-slate-400">{srtFiles.length > 0 ? `已选 ${srtFiles.length} 个文件` : '点击或拖拽 SRT/TXT 文件'}</p>
           </div>
         </div>
       </div>
 
       {isProcessing && (
-          <div className="w-full bg-slate-800 rounded-full h-2.5 mb-1">
-            <div className="bg-indigo-600 h-2.5 rounded-full transition-all duration-300" style={{ width: `${progress}%` }}></div>
+          <div className="w-full bg-slate-800 rounded-full h-2">
+            <div className="bg-indigo-600 h-2 rounded-full transition-all duration-300" style={{ width: `${progress}%` }}></div>
           </div>
       )}
 
       <div className="flex gap-2">
-        <button 
-            onClick={handleProcessFiles}
-            disabled={srtFiles.length === 0 || isProcessing}
-            className={`flex-1 px-4 py-2 rounded text-sm font-medium text-white transition ${
-                srtFiles.length === 0 || isProcessing 
-                ? 'bg-slate-700 cursor-not-allowed text-slate-500' 
-                : 'bg-indigo-600 hover:bg-indigo-500'
-            }`}
-        >
-            {isProcessing ? <span className="flex items-center justify-center gap-2"><Loader2 className="w-4 h-4 animate-spin"/> 处理中 ({progress}%)</span> : '批量生成 JSON'}
+        <button onClick={handleProcessFiles} disabled={!srtFiles.length || isProcessing}
+            className={`flex-1 px-3 py-2 rounded text-xs font-medium text-white transition ${!srtFiles.length || isProcessing ? 'bg-slate-700 text-slate-500' : 'bg-indigo-600 hover:bg-indigo-500'}`}>
+            {isProcessing ? '处理中...' : '开始解析'}
         </button>
-        
         {srtFiles.length > 0 && !isProcessing && (
-            <button 
-                onClick={clearFiles}
-                className="px-4 py-2 bg-red-500/10 text-red-400 hover:bg-red-500/20 rounded border border-red-500/20"
-                title="清空列表"
-            >
-                <Trash2 className="w-5 h-5" />
+            <button onClick={() => {setSrtFiles([]); setGeneratedJson('');}} className="px-3 py-2 bg-slate-800 text-slate-400 rounded hover:bg-red-900/20 hover:text-red-400">
+                <Trash2 className="w-4 h-4" />
             </button>
         )}
       </div>
 
       {generatedJson && (
-        <div className="relative mt-4 animate-in fade-in zoom-in duration-300">
+        <div className="mt-2 p-3 bg-black/30 rounded border border-slate-800">
           <div className="flex justify-between items-center mb-2">
-            <span className="text-xs text-green-400 font-mono">生成成功! (包含 {JSON.parse(generatedJson).length} 个视频)</span>
+            <span className="text-xs text-green-400 font-mono">成功生成!</span>
             <div className="flex gap-2">
-                <button 
-                onClick={copyToClipboard}
-                className="flex items-center gap-1 px-3 py-1 bg-slate-700 hover:bg-slate-600 rounded text-xs text-white"
-                >
-                <Copy className="w-3 h-3" /> 复制内容
-                </button>
-                <button 
-                onClick={downloadJson}
-                className="flex items-center gap-1 px-3 py-1 bg-indigo-600 hover:bg-indigo-500 rounded text-xs text-white"
-                >
-                <Download className="w-3 h-3" /> 下载文件
-                </button>
+                <button onClick={copyToClipboard} className="text-xs text-slate-400 hover:text-white"><Copy className="w-3 h-3" /></button>
+                <button onClick={downloadJson} className="text-xs text-indigo-400 hover:text-indigo-300"><Download className="w-3 h-3" /></button>
             </div>
           </div>
-          <div className="bg-black p-4 rounded border border-slate-700 h-24 flex items-center justify-center text-slate-500 text-xs">
-              JSON 数据已生成 ({generatedJson.length.toLocaleString()} 字符)。请直接下载或复制。
-          </div>
+          <p className="text-[10px] text-slate-500 truncate">JSON 大小: {(generatedJson.length/1024).toFixed(2)} KB</p>
         </div>
       )}
-      {status && <p className="text-xs text-indigo-400 mt-2">{status}</p>}
+      {status && <p className="text-xs text-indigo-400 mt-1">{status}</p>}
     </div>
   );
 };
@@ -811,47 +859,169 @@ const AdminPanel = ({ onClose, onDbUpdate }: { onClose: () => void, onDbUpdate: 
   const [activeTab, setActiveTab] = useState<'users' | 'data' | 'coze'>('users');
   const [users, setUsers] = useState<UserAccount[]>([]);
   const [settings, setSettings] = useState<AppSettings>(MockDB.getSettings());
-  const [saveStatus, setSaveStatus] = useState('');
+  const [jsonSaveStatus, setJsonSaveStatus] = useState('');
+  const [supabaseSaveStatus, setSupabaseSaveStatus] = useState('');
+  const [cozeSaveStatus, setCozeSaveStatus] = useState('');
+  
+  // Migration State (Videos)
+  const [migrationData, setMigrationData] = useState<VideoData[] | null>(null);
+  const [isMigrating, setIsMigrating] = useState(false);
+  const [migrationStatus, setMigrationStatus] = useState('');
+  const [migrationResult, setMigrationResult] = useState<'success' | 'error' | null>(null);
+  const [showConfirmDialog, setShowConfirmDialog] = useState(false);
+  
+  // Migration State (Users)
+  const [isUserMigrating, setIsUserMigrating] = useState(false);
+  const [userMigrationMsg, setUserMigrationMsg] = useState('');
 
   useEffect(() => {
-    setUsers(MockDB.getUsers());
-  }, []);
+    fetchUsers();
+  }, [activeTab]); // Refetch when tab changes
 
-  const handleStatusChange = (userId: string, newStatus: UserStatus) => {
-    MockDB.updateUserStatus(userId, newStatus);
-    setUsers(MockDB.getUsers());
+  const fetchUsers = async () => {
+    // Priority: Cloud -> Local
+    let userList: UserAccount[] = [];
+    if (settings.supabaseUrl && settings.supabaseKey) {
+        userList = await SupabaseService.getUsers();
+    } 
+    // If Cloud fails or returns empty, logic implies we rely on what we have, 
+    // but here we just show what is in the active data source or fallback to local if cloud is not config
+    if (userList.length === 0 && (!settings.supabaseUrl || !settings.supabaseKey)) {
+        userList = MockDB.getUsers();
+    }
+    setUsers(userList);
+  };
+
+  const handleStatusChange = async (userId: string, newStatus: UserStatus) => {
+    if (settings.supabaseUrl && settings.supabaseKey) {
+        await SupabaseService.updateUserStatus(userId, newStatus);
+    } else {
+        MockDB.updateUserStatus(userId, newStatus);
+    }
+    fetchUsers();
   };
   
-  const handleNoteBlur = (userId: string, newNote: string) => {
-      MockDB.updateUserNote(userId, newNote);
-      setUsers(MockDB.getUsers());
+  const handleNoteBlur = async (userId: string, newNote: string) => {
+    if (settings.supabaseUrl && settings.supabaseKey) {
+        await SupabaseService.updateUserNote(userId, newNote);
+    } else {
+        MockDB.updateUserNote(userId, newNote);
+    }
+    fetchUsers();
   };
 
-  const handleSaveSettings = () => {
+  const handleSaveJsonSettings = () => {
     MockDB.saveSettings(settings);
-    setSaveStatus('设置已保存。正在刷新数据...');
-    setTimeout(() => {
-        setSaveStatus('');
-        onDbUpdate(); 
-    }, 1500);
+    setJsonSaveStatus('success');
+    setTimeout(() => { setJsonSaveStatus(''); onDbUpdate(); }, 2000);
   };
-  
-  const COZE_PROMPT_TEMPLATE = `
-角色: 视频搜索助手
-任务: 根据用户的问题，在知识库（字幕数据）中查找最相关的视频片段。
-输出要求:
-1. 必须只返回 JSON 数组格式。
-2. 不要包含 markdown 格式 (如 \`\`\`json)，不要包含任何解释性文字。
-3. 如果找不到，返回空数组 []。
 
-JSON 格式示例:
-[
-  {
-    "videoId": "视频ID或完整标题",
-    "timestamp": "HH:MM:SS",
-    "reasoning": "匹配理由(中文)"
-  }
-]
+  const handleSaveSupabaseSettings = () => {
+    MockDB.saveSettings(settings);
+    setSupabaseSaveStatus('success');
+    setTimeout(() => { 
+        setSupabaseSaveStatus(''); 
+        onDbUpdate(); 
+        fetchUsers(); // Refresh users from cloud if newly connected
+    }, 2000);
+  };
+
+  const handleSaveCozeSettings = () => {
+    MockDB.saveSettings(settings);
+    setCozeSaveStatus('success');
+    setTimeout(() => { setCozeSaveStatus(''); onDbUpdate(); }, 2000);
+  };
+
+  const handleMigrationClick = () => {
+    if (!migrationData || migrationData.length === 0) return;
+    if (!settings.supabaseUrl || !settings.supabaseKey) {
+        setMigrationResult('error');
+        setMigrationStatus("请先保存 Supabase 连接信息！");
+        return;
+    }
+    setShowConfirmDialog(true);
+  };
+
+  const confirmMigration = async () => {
+    setShowConfirmDialog(false);
+    setIsMigrating(true);
+    setMigrationResult(null);
+    setMigrationStatus("开始连接云数据库...");
+    
+    try {
+        await SupabaseService.uploadData(migrationData, (msg) => setMigrationStatus(msg));
+        setMigrationResult('success');
+        setMigrationStatus("数据上传成功！已自动切换到云端模式。");
+        setMigrationData(null); 
+        onDbUpdate(); 
+    } catch (e) {
+        setMigrationResult('error');
+        setMigrationStatus(`上传失败: ${e instanceof Error ? e.message : '未知错误'}`);
+    } finally {
+        setIsMigrating(false);
+    }
+  };
+
+  const handleUserMigration = async () => {
+      if (!settings.supabaseUrl || !settings.supabaseKey) return;
+      setIsUserMigrating(true);
+      setUserMigrationMsg('正在迁移...');
+      try {
+          const localUsers = MockDB.getUsers();
+          await SupabaseService.migrateUsers(localUsers);
+          setUserMigrationMsg(`成功迁移 ${localUsers.length} 个用户`);
+          fetchUsers(); // Refresh list from cloud
+      } catch (e) {
+          setUserMigrationMsg('迁移失败');
+          console.error(e);
+      } finally {
+          setTimeout(() => setUserMigrationMsg(''), 3000);
+          setIsUserMigrating(false);
+      }
+  };
+
+  const SUPABASE_SQL = `
+-- 1. 创建视频表
+create table if not exists videos (
+  id text primary key,
+  title text,
+  file_name text,
+  upload_date text,
+  public_url text
+);
+
+-- 2. 创建字幕表
+create table if not exists transcripts (
+  id bigint generated by default as identity primary key,
+  video_id text references videos(id),
+  start_time text,
+  end_time text,
+  text text,
+  seconds numeric
+);
+
+-- 3. 创建用户表 (Simple Auth)
+create table if not exists app_users (
+  id text primary key,
+  username text unique,
+  password text,
+  role text,
+  status text,
+  note text
+);
+
+-- 4. 开启全文检索 (加速搜索)
+alter table transcripts add column if not exists fts tsvector generated always as (to_tsvector('simple', text)) stored;
+create index if not exists transcripts_fts on transcripts using GIN (fts);
+
+-- 5. 配置访问权限 (重要：允许读写)
+alter table videos enable row level security;
+alter table transcripts enable row level security;
+alter table app_users enable row level security;
+
+create policy "Enable access for all users" on videos for all using (true) with check (true);
+create policy "Enable access for all users" on transcripts for all using (true) with check (true);
+create policy "Enable access for all users" on app_users for all using (true) with check (true);
   `.trim();
 
   return (
@@ -862,250 +1032,168 @@ JSON 格式示例:
             <span className="text-indigo-400"><Shield className="w-5 h-5" /></span>
             管理后台
           </h2>
-          <button onClick={onClose} className="text-slate-400 hover:text-white">
-            <span className="text-slate-400 hover:text-white"><XCircle className="w-6 h-6" /></span>
-          </button>
+          <button onClick={onClose} className="text-slate-400 hover:text-white"><XCircle className="w-6 h-6" /></button>
         </div>
 
         <div className="flex border-b border-slate-700 bg-slate-900/50">
-          <button 
-            onClick={() => setActiveTab('users')}
-            className={`px-6 py-3 text-sm font-medium transition ${activeTab === 'users' ? 'text-indigo-400 border-b-2 border-indigo-400 bg-slate-800' : 'text-slate-400 hover:text-white'}`}
-          >
-            用户管理
-          </button>
-          <button 
-            onClick={() => setActiveTab('data')}
-            className={`px-6 py-3 text-sm font-medium transition ${activeTab === 'data' ? 'text-indigo-400 border-b-2 border-indigo-400 bg-slate-800' : 'text-slate-400 hover:text-white'}`}
-          >
-            数据库配置
-          </button>
-          <button 
-            onClick={() => setActiveTab('coze')}
-            className={`px-6 py-3 text-sm font-medium transition ${activeTab === 'coze' ? 'text-indigo-400 border-b-2 border-indigo-400 bg-slate-800' : 'text-slate-400 hover:text-white'}`}
-          >
-            Coze AI 设置
-          </button>
+          {['users', 'data', 'coze'].map(tab => (
+              <button key={tab} onClick={() => setActiveTab(tab as any)}
+                className={`px-6 py-3 text-sm font-medium transition capitalize ${activeTab === tab ? 'text-indigo-400 border-b-2 border-indigo-400 bg-slate-800' : 'text-slate-400 hover:text-white'}`}>
+                {tab === 'users' ? '用户管理' : tab === 'data' ? '数据库配置' : 'Coze AI'}
+              </button>
+          ))}
         </div>
         
-        <div className="overflow-y-auto p-6 flex-1">
+        <div className="overflow-y-auto p-6 flex-1 custom-scrollbar">
           {activeTab === 'users' && (
-            <table className="w-full text-left text-sm text-slate-300">
-              <thead className="text-xs uppercase bg-slate-700 text-slate-400">
-                <tr>
-                  <th className="px-4 py-3 rounded-tl-lg">用户名</th>
-                  <th className="px-4 py-3">角色</th>
-                  <th className="px-4 py-3">备注</th>
-                  <th className="px-4 py-3">状态</th>
-                  <th className="px-4 py-3 rounded-tr-lg">操作</th>
-                </tr>
-              </thead>
-              <tbody>
-                {users.map(user => (
-                  <tr key={user.id} className="border-b border-slate-700 hover:bg-slate-700/50">
-                    <td className="px-4 py-3 font-medium text-white">{user.username}</td>
-                    <td className="px-4 py-3">{user.role === 'admin' ? '管理员' : '用户'}</td>
-                    <td className="px-4 py-3">
-                        <input 
-                            type="text" 
-                            defaultValue={user.note || ''}
-                            onBlur={(e) => handleNoteBlur(user.id, e.target.value)}
-                            placeholder="点击添加备注..."
-                            className="bg-transparent border border-transparent hover:border-slate-600 focus:border-indigo-500 rounded px-2 py-1 w-full text-xs text-slate-300 outline-none"
-                        />
-                    </td>
-                    <td className="px-4 py-3">
-                      <span className={`px-2 py-1 rounded-full text-xs font-bold ${
-                        user.status === 'active' ? 'bg-green-500/20 text-green-400' :
-                        user.status === 'pending' ? 'bg-yellow-500/20 text-yellow-400' :
-                        'bg-red-500/20 text-red-400'
-                      }`}>
-                        {user.status === 'active' ? '活跃' : user.status === 'pending' ? '待审核' : '已拒绝'}
-                      </span>
-                    </td>
-                    <td className="px-4 py-3">
-                      {user.role !== 'admin' && (
-                        <div className="flex gap-2">
-                          {user.status !== 'active' && (
-                            <button 
-                              onClick={() => handleStatusChange(user.id, 'active')}
-                              className="p-1 bg-green-600/20 text-green-400 rounded hover:bg-green-600/40"
-                              title="批准"
-                            >
-                              <span className="text-green-400"><CheckCircle className="w-4 h-4" /></span>
-                            </button>
-                          )}
-                          {user.status !== 'rejected' && (
-                            <button 
-                              onClick={() => handleStatusChange(user.id, 'rejected')}
-                              className="p-1 bg-red-600/20 text-red-400 rounded hover:bg-red-600/40"
-                              title="拒绝"
-                            >
-                              <span className="text-red-400"><XCircle className="w-4 h-4" /></span>
-                            </button>
-                          )}
+            <div>
+                {settings.supabaseUrl && settings.supabaseKey && (
+                    <div className="mb-4 bg-indigo-900/20 border border-indigo-500/30 p-3 rounded flex justify-between items-center">
+                        <div className="flex gap-2 items-center">
+                            <Cloud className="w-4 h-4 text-indigo-400" />
+                            <span className="text-xs text-indigo-200">当前显示：Supabase 云端用户数据</span>
                         </div>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+                        <button onClick={handleUserMigration} disabled={isUserMigrating} className="text-xs bg-indigo-600 hover:bg-indigo-500 px-3 py-1.5 rounded text-white flex gap-1">
+                            {isUserMigrating ? <Loader2 className="w-3 h-3 animate-spin" /> : <Users className="w-3 h-3" />}
+                            {userMigrationMsg || "一键迁移本地用户到云端"}
+                        </button>
+                    </div>
+                )}
+
+                <table className="w-full text-left text-sm text-slate-300">
+                <thead className="text-xs uppercase bg-slate-700 text-slate-400">
+                    <tr><th className="px-4 py-3">用户名</th><th className="px-4 py-3">备注</th><th className="px-4 py-3">状态</th><th className="px-4 py-3">操作</th></tr>
+                </thead>
+                <tbody>
+                    {users.map(user => (
+                    <tr key={user.id} className="border-b border-slate-700">
+                        <td className="px-4 py-3">{user.username} <span className="text-xs opacity-50 ml-1">({user.role})</span></td>
+                        <td className="px-4 py-3">
+                            <input type="text" defaultValue={user.note || ''} onBlur={(e) => handleNoteBlur(user.id, e.target.value)}
+                                placeholder="..." className="bg-transparent focus:border-indigo-500 border-b border-transparent outline-none w-full" />
+                        </td>
+                        <td className="px-4 py-3">
+                        <span className={`px-2 py-0.5 rounded text-xs ${user.status === 'active' ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
+                            {user.status}
+                        </span>
+                        </td>
+                        <td className="px-4 py-3 flex gap-2">
+                        {user.role !== 'admin' && (
+                            <>
+                            <button onClick={() => handleStatusChange(user.id, 'active')} className="text-green-400"><CheckCircle className="w-4 h-4"/></button>
+                            <button onClick={() => handleStatusChange(user.id, 'rejected')} className="text-red-400"><XCircle className="w-4 h-4"/></button>
+                            </>
+                        )}
+                        </td>
+                    </tr>
+                    ))}
+                    {users.length === 0 && <tr><td colSpan={4} className="text-center py-4 text-slate-500">暂无用户数据</td></tr>}
+                </tbody>
+                </table>
+            </div>
           )}
 
           {activeTab === 'data' && (
-            <div className="space-y-8">
-              <div className="bg-slate-800 border border-slate-700 rounded-xl p-6">
-                <h3 className="text-lg font-semibold text-white mb-2 flex items-center gap-2">
-                    <span className="text-indigo-400"><Cloud className="w-5 h-5" /></span> 远程数据库连接
-                </h3>
-                <p className="text-sm text-slate-400 mb-4">
-                  连接到一个外部的 JSON 文件 (例如: GitHub Gist, Raw GitHub URL)。
-                  <br/>
-                  <span className="text-indigo-400 text-xs">注意：如果输入 GitHub Blob 链接，系统会自动转换为 Raw 链接。</span>
-                </p>
-                <div className="flex gap-2 items-center">
-                  <input 
-                    type="text" 
-                    placeholder="https://..." 
-                    className="flex-1 bg-slate-900 border border-slate-700 rounded p-2 text-white text-sm"
-                    value={settings.remoteDatabaseUrl}
-                    onChange={e => setSettings({...settings, remoteDatabaseUrl: e.target.value})}
-                  />
-                  <button 
-                    onClick={handleSaveSettings}
-                    className="bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded text-sm"
-                  >
-                    保存
+            <div className="space-y-6">
+              {/* Plan A: Remote JSON */}
+              <div className="bg-slate-800 border border-slate-700 rounded-xl p-5">
+                <h3 className="text-md font-semibold text-white mb-2 flex gap-2"><Files className="w-5 h-5 text-indigo-400"/> 方案 A: 远程 JSON (轻量级)</h3>
+                <div className="flex gap-2">
+                  <input type="text" placeholder="https://example.com/data.json" className="flex-1 bg-slate-900 border border-slate-700 rounded p-2 text-white text-sm"
+                    value={settings.remoteDatabaseUrl} onChange={e => setSettings({...settings, remoteDatabaseUrl: e.target.value})} />
+                  <button onClick={handleSaveJsonSettings} className="bg-slate-700 hover:bg-slate-600 text-white px-3 rounded text-sm whitespace-nowrap min-w-[60px] flex items-center justify-center">
+                      {jsonSaveStatus === 'success' ? <span className="text-green-400 flex items-center gap-1"><Check className="w-3 h-3"/> 已保存</span> : '保存'}
                   </button>
-                  {saveStatus && <span className="ml-2 text-green-400 text-sm animate-in fade-in slide-in-from-left-2">{saveStatus}</span>}
                 </div>
               </div>
 
-              <div className="bg-slate-800 border border-slate-700 rounded-xl p-6">
-                <h3 className="text-lg font-semibold text-white mb-2 flex items-center gap-2">
-                    <span className="text-indigo-400"><Files className="w-5 h-5" /></span> 批量数据生成器
-                </h3>
-                <BatchJsonGenerator />
+              {/* Plan B: Supabase (Cloud DB) */}
+              <div className="bg-slate-800 border border-indigo-500/30 rounded-xl p-5 relative overflow-hidden">
+                <div className="absolute top-0 right-0 bg-indigo-600 text-white text-[10px] px-2 py-1 rounded-bl">推荐方案 (支持海量数据)</div>
+                <h3 className="text-md font-semibold text-white mb-4 flex gap-2"><Database className="w-5 h-5 text-indigo-400"/> 方案 B: Supabase 云数据库</h3>
+                
+                <div className="grid grid-cols-2 gap-4 mb-4">
+                    <div>
+                        <label className="text-xs text-slate-400">Project URL</label>
+                        <input type="text" className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white text-sm"
+                            value={settings.supabaseUrl} onChange={e => setSettings({...settings, supabaseUrl: e.target.value})} />
+                    </div>
+                    <div>
+                        <label className="text-xs text-slate-400">API Key (anon/public)</label>
+                        <input type="password" className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white text-sm"
+                            value={settings.supabaseKey} onChange={e => setSettings({...settings, supabaseKey: e.target.value})} />
+                    </div>
+                </div>
+                <button onClick={handleSaveSupabaseSettings} className={`w-full py-2 rounded text-sm mb-6 transition flex items-center justify-center gap-2 font-medium ${supabaseSaveStatus === 'success' ? 'bg-green-600 text-white' : 'bg-indigo-600 hover:bg-indigo-500 text-white'}`}>
+                    {supabaseSaveStatus === 'success' ? <><Check className="w-4 h-4"/> 配置已保存</> : '保存云端配置'}
+                </button>
+
+                <div className="border-t border-slate-700 pt-4">
+                    <h4 className="text-sm font-medium text-slate-300 mb-2">步骤 1: 数据库初始化 (运行 SQL)</h4>
+                    <div className="relative group">
+                        <pre className="bg-black p-3 rounded text-[10px] text-slate-400 font-mono h-24 overflow-y-auto border border-slate-700">{SUPABASE_SQL}</pre>
+                        <button onClick={() => navigator.clipboard.writeText(SUPABASE_SQL)} className="absolute top-2 right-2 p-1 bg-slate-700 text-white text-xs rounded opacity-0 group-hover:opacity-100 transition">复制 SQL</button>
+                    </div>
+                </div>
+
+                <div className="border-t border-slate-700 pt-4 mt-4">
+                    <h4 className="text-sm font-medium text-slate-300 mb-2">步骤 2: 数据生成与迁移</h4>
+                    <div className="bg-slate-900/50 p-3 rounded border border-slate-700/50">
+                        <BatchJsonGenerator onDataReady={(data) => setMigrationData(data)} />
+                        
+                        {migrationData && (
+                            <div className="mt-4 flex flex-col gap-3 bg-indigo-900/20 p-3 rounded border border-indigo-500/30">
+                                <div className="flex items-center justify-between">
+                                    <div className="text-xs">
+                                        <p className="text-indigo-300 font-bold">准备就绪</p>
+                                        <p className="text-slate-400">已解析 {migrationData.length} 个视频，可以直接上传到云端。</p>
+                                    </div>
+                                    {!showConfirmDialog ? (
+                                        <button 
+                                            onClick={handleMigrationClick}
+                                            disabled={isMigrating}
+                                            className={`px-4 py-2 rounded text-xs font-bold flex items-center gap-2 ${isMigrating ? 'bg-slate-700' : 'bg-green-600 hover:bg-green-500 text-white'}`}
+                                        >
+                                            {isMigrating ? <Loader2 className="w-3 h-3 animate-spin" /> : <Cloud className="w-3 h-3" />}
+                                            {isMigrating ? '正在上传...' : '开始上传到 Supabase'}
+                                        </button>
+                                    ) : (
+                                        <div className="flex items-center gap-2 animate-in fade-in slide-in-from-right-4 duration-300">
+                                            <span className="text-xs text-yellow-500 font-medium mr-2">确定上传吗？(耗时操作)</span>
+                                            <button onClick={confirmMigration} className="px-3 py-1.5 bg-green-600 text-white text-xs rounded hover:bg-green-500">确定</button>
+                                            <button onClick={() => setShowConfirmDialog(false)} className="px-3 py-1.5 bg-slate-700 text-slate-300 text-xs rounded hover:bg-slate-600">取消</button>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+                        
+                        {(migrationResult || migrationStatus) && !migrationData && (
+                            <div className={`mt-4 p-3 rounded border flex items-center gap-3 ${migrationResult === 'error' ? 'bg-red-900/20 border-red-500/30 text-red-300' : 'bg-green-900/20 border-green-500/30 text-green-300'}`}>
+                                {migrationResult === 'error' ? <AlertCircle className="w-5 h-5"/> : <CheckCircle className="w-5 h-5"/>}
+                                <span className="text-xs">{migrationStatus}</span>
+                            </div>
+                        )}
+                    </div>
+                </div>
               </div>
             </div>
           )}
 
           {activeTab === 'coze' && (
-            <div className="space-y-6">
-              
-              {/* Coze Knowledge Base Setup Guide */}
-              <div className="bg-indigo-900/20 border border-indigo-500/30 rounded-xl p-6">
-                 <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
-                    <span className="text-indigo-400"><BookOpen className="w-5 h-5" /></span> 必读：知识库配置四部曲
-                 </h3>
-                 <div className="text-sm text-slate-300 space-y-3">
-                    <p>Coze 机器人无法直接读取你的前端网页数据。你必须把同样的数据传给它：</p>
-                    <ol className="list-decimal list-inside space-y-2 ml-2">
-                        <li>
-                            <strong className="text-white">生成数据</strong>：使用"数据库配置"中的生成器，生成一个包含所有字幕的 JSON 文件。
-                        </li>
-                        <li>
-                            <strong className="text-white">创建知识库</strong>：前往 Coze 平台，左侧点击 <strong>[+] → 知识库</strong>，新建并上传这个 JSON 文件。
-                        </li>
-                        <li>
-                            <strong className="text-white">关联 Bot</strong>：在你的 Bot 编排页面，点击中间的 <strong>[+] → 知识库</strong>，把刚才创建的库加进去。
-                        </li>
-                        <li>
-                            <strong className="text-white">发布</strong>：最后点击右上角 <strong>发布</strong>，并勾选 <strong>Agent as API</strong>。
-                        </li>
-                    </ol>
-                    <p className="text-xs text-indigo-400 mt-2">
-                        如果不做这一步，Bot 会提示 "没有提供知识库"。
-                    </p>
-                 </div>
-              </div>
-
-              <div className="bg-slate-800 border border-slate-700 rounded-xl p-6">
-                 <h3 className="text-lg font-semibold text-white mb-4 flex items-center gap-2">
-                    <span className="text-indigo-400"><Bot className="w-5 h-5" /></span> API 连接配置
-                 </h3>
-                 <div className="space-y-4">
-                    {/* Region Selector */}
-                    <div>
-                        <label className="block text-slate-400 text-sm mb-2">Coze 区域 (平台版本)</label>
-                        <div className="flex gap-4">
-                            <button
-                                onClick={() => setSettings({...settings, cozeBaseUrl: 'https://api.coze.cn'})}
-                                className={`flex items-center gap-2 px-4 py-2 rounded-lg border text-sm transition ${
-                                    settings.cozeBaseUrl === 'https://api.coze.cn'
-                                    ? 'bg-indigo-600 border-indigo-500 text-white'
-                                    : 'bg-slate-900 border-slate-700 text-slate-400 hover:bg-slate-800'
-                                }`}
-                            >
-                                <Flag className="w-4 h-4" /> 中国版 (api.coze.cn)
-                            </button>
-                            <button
-                                onClick={() => setSettings({...settings, cozeBaseUrl: 'https://api.coze.com'})}
-                                className={`flex items-center gap-2 px-4 py-2 rounded-lg border text-sm transition ${
-                                    settings.cozeBaseUrl === 'https://api.coze.com'
-                                    ? 'bg-indigo-600 border-indigo-500 text-white'
-                                    : 'bg-slate-900 border-slate-700 text-slate-400 hover:bg-slate-800'
-                                }`}
-                            >
-                                <Globe className="w-4 h-4" /> 国际版 (api.coze.com)
-                            </button>
-                        </div>
-                    </div>
-
-                    <div>
-                        <label className="block text-slate-400 text-sm mb-1">Coze Bot ID</label>
-                        <input 
-                          type="text" 
-                          placeholder="例如：73428..." 
-                          className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white text-sm"
-                          value={settings.cozeBotId}
-                          onChange={e => setSettings({...settings, cozeBotId: e.target.value})}
-                        />
-                    </div>
-                    <div>
-                        <label className="block text-slate-400 text-sm mb-1">个人访问令牌 (PAT)</label>
-                        <input 
-                          type="password" 
-                          placeholder="例如：pat_..." 
-                          className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white text-sm"
-                          value={settings.cozeApiKey}
-                          onChange={e => setSettings({...settings, cozeApiKey: e.target.value})}
-                        />
-                    </div>
-                    <div className="flex items-center gap-4">
-                        <button 
-                        onClick={handleSaveSettings}
-                        className="bg-indigo-600 hover:bg-indigo-500 text-white px-6 py-2 rounded text-sm font-medium"
-                        >
-                        保存配置
-                        </button>
-                        {saveStatus && <span className="text-green-400 text-sm animate-in fade-in slide-in-from-left-2">{saveStatus}</span>}
-                    </div>
-                 </div>
-              </div>
-
-              <div className="bg-slate-800 border border-slate-700 rounded-xl p-6">
-                 <h3 className="text-lg font-semibold text-white mb-2">Bot 系统提示词模板 (System Prompt)</h3>
-                 <p className="text-sm text-slate-400 mb-4">
-                    为了确保搜索功能正常，Bot 返回的数据格式必须严格符合要求。请使用下方的 Prompt：
-                 </p>
-                 <div className="relative">
-                    <pre className="bg-black p-4 rounded text-xs text-slate-300 overflow-x-auto border border-slate-700 font-mono whitespace-pre-wrap">
-                        {COZE_PROMPT_TEMPLATE}
-                    </pre>
-                    <button 
-                        onClick={() => {
-                            navigator.clipboard.writeText(COZE_PROMPT_TEMPLATE);
-                            alert("已复制提示词！");
-                        }}
-                        className="absolute top-2 right-2 p-1 bg-slate-700 hover:bg-slate-600 rounded text-white"
-                        title="复制"
-                    >
-                        <span className="text-white"><Copy className="w-4 h-4" /></span>
+            <div className="space-y-4">
+               <div className="bg-slate-800 border border-slate-700 rounded-xl p-5">
+                 <h3 className="text-md font-semibold text-white mb-4 flex items-center gap-2"><Bot className="w-5 h-5 text-indigo-400" /> API 配置</h3>
+                 <div className="space-y-3">
+                    <input type="text" placeholder="Bot ID" className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white text-sm"
+                          value={settings.cozeBotId} onChange={e => setSettings({...settings, cozeBotId: e.target.value})} />
+                    <input type="password" placeholder="PAT Token" className="w-full bg-slate-900 border border-slate-700 rounded p-2 text-white text-sm"
+                          value={settings.cozeApiKey} onChange={e => setSettings({...settings, cozeApiKey: e.target.value})} />
+                    <button onClick={handleSaveCozeSettings} className={`w-full py-2 rounded text-sm transition font-medium ${cozeSaveStatus === 'success' ? 'bg-green-600 text-white' : 'bg-indigo-600 hover:bg-indigo-500 text-white'}`}>
+                        {cozeSaveStatus === 'success' ? '已保存' : '保存 Coze 配置'}
                     </button>
                  </div>
-              </div>
+               </div>
             </div>
           )}
         </div>
@@ -1119,7 +1207,7 @@ JSON 格式示例:
 const App = () => {
   const [currentUser, setCurrentUser] = useState<UserAccount | null>(null);
   const [showAdmin, setShowAdmin] = useState(false);
-  const [videos, setVideos] = useState<VideoData[]>([]);
+  const [videos, setVideos] = useState<VideoData[]>([]); // For local/remote JSON mode
   const [searchQuery, setSearchQuery] = useState('');
   const [isAiSearch, setIsAiSearch] = useState(false);
   const [isSearching, setIsSearching] = useState(false);
@@ -1127,134 +1215,98 @@ const App = () => {
   
   const [selectedVideo, setSelectedVideo] = useState<VideoData | null>(null);
   const [loadingVideos, setLoadingVideos] = useState(false);
-  const [dbSource, setDbSource] = useState<'local' | 'remote'>('local');
+  const [dbMode, setDbMode] = useState<'local' | 'supabase'>('local');
   const [fetchError, setFetchError] = useState('');
   
-  // New State for transcript navigation
   const [activeSegmentIndex, setActiveSegmentIndex] = useState<number>(-1);
   const videoRef = useRef<HTMLVideoElement>(null);
   const transcriptRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     MockDB.init();
-    fetchVideos();
+    initData();
   }, []);
   
-  // Re-run search when query/mode changes, with debounce
   useEffect(() => {
-    const timer = setTimeout(() => {
-        handleSearch();
-    }, isAiSearch ? 1000 : 300); // Longer debounce for AI
+    const timer = setTimeout(() => { handleSearch(); }, isAiSearch ? 1000 : 500);
     return () => clearTimeout(timer);
-  }, [searchQuery, isAiSearch, videos]);
+  }, [searchQuery, isAiSearch]);
 
-  // Auto-scroll transcript when active segment changes
   useEffect(() => {
     if (activeSegmentIndex !== -1 && transcriptRef.current) {
-        // Try to access the child element safely
-        // Wait a tick for DOM update if switching videos
         setTimeout(() => {
             const child = transcriptRef.current?.children[activeSegmentIndex] as HTMLElement;
-            if (child) {
-                child.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            }
+            if (child) child.scrollIntoView({ behavior: 'smooth', block: 'center' });
         }, 100);
     }
-  }, [activeSegmentIndex, selectedVideo]); // Add selectedVideo as dep to trigger scroll on video switch
+  }, [activeSegmentIndex]);
 
-  const fetchVideos = async () => {
+  const initData = async () => {
     setLoadingVideos(true);
-    setFetchError('');
     const settings = MockDB.getSettings();
-    let allVideos: VideoData[] = [];
-    let remoteUrl = settings.remoteDatabaseUrl?.trim();
-
-    if (remoteUrl) {
-      // Fix GitHub Blob URLs to Raw URLs automatically
-      if (remoteUrl.includes('github.com') && remoteUrl.includes('/blob/')) {
-        remoteUrl = remoteUrl.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/');
-      }
-
-      try {
-        const response = await fetch(remoteUrl);
-        if (response.ok) {
-          const remoteData = await response.json();
-          if (Array.isArray(remoteData)) {
-            allVideos = [...remoteData];
-            setDbSource('remote');
-          } else {
-            console.warn("Remote data is not an array");
-            setFetchError("远程数据格式错误 (不是 JSON 数组)");
-            setDbSource('local');
-          }
-        } else {
-          console.warn(`Fetch failed: ${response.status}`);
-          setFetchError(`连接失败: HTTP ${response.status}`);
-          setDbSource('local');
-        }
-      } catch (e) {
-        console.warn("无法连接远程数据库，切换至本地模式", e);
-        setFetchError("无法连接远程数据库 (请检查跨域/URL)");
-        setDbSource('local');
-      }
+    
+    // Priority: Supabase > Remote JSON > Local
+    if (settings.supabaseUrl && settings.supabaseKey) {
+        console.log("Initializing in Supabase Mode");
+        setDbMode('supabase');
+        setVideos([]); // Clear videos to avoid confusion, Supabase handles search
     } else {
-      setDbSource('local');
-    }
+        console.log("Initializing in Local/Remote Mode");
+        setDbMode('local');
+        
+        let allVideos: VideoData[] = [];
+        const remoteUrl = settings.remoteDatabaseUrl?.trim();
 
-    const localVideos = MockDB.getLocalVideos();
-    // Prioritize remote videos, append local videos
-    allVideos = [...allVideos, ...localVideos];
-    setVideos(allVideos);
+        if (remoteUrl) {
+          try {
+            const finalUrl = remoteUrl.includes('github.com') && remoteUrl.includes('/blob/') 
+                ? remoteUrl.replace('github.com', 'raw.githubusercontent.com').replace('/blob/', '/')
+                : remoteUrl;
+            const response = await fetch(finalUrl);
+            if (response.ok) {
+              const remoteData = await response.json();
+              if (Array.isArray(remoteData)) allVideos = [...remoteData];
+            }
+          } catch (e) { console.warn("Remote fetch failed", e); }
+        }
+        const localVideos = MockDB.getLocalVideos();
+        allVideos = [...allVideos, ...localVideos];
+        setVideos(allVideos);
+    }
     setLoadingVideos(false);
   };
   
   const handleSearch = async () => {
-      if (!searchQuery.trim()) {
-          setSearchResults([]);
-          return;
-      }
+      if (!searchQuery.trim()) { setSearchResults([]); return; }
+      setIsSearching(true);
+      const settings = MockDB.getSettings();
 
-      if (isAiSearch) {
-          setIsSearching(true);
-          const settings = MockDB.getSettings();
-          const results = await cozeSearch(searchQuery, settings, videos);
-          setSearchResults(results);
+      try {
+          // 1. AI Search (Coze) - Takes precedence if toggled
+          if (isAiSearch) {
+              const results = await cozeSearch(searchQuery, settings, videos);
+              setSearchResults(results);
+          } 
+          // 2. Supabase Search (Plan B)
+          else if (dbMode === 'supabase') {
+              const results = await SupabaseService.search(searchQuery);
+              setSearchResults(results);
+          } 
+          // 3. Local/Remote JSON Search (Plan A)
+          else {
+              const results = fallbackSearch(searchQuery, videos);
+              setSearchResults(results);
+          }
+      } catch (e) {
+          console.error(e);
+      } finally {
           setIsSearching(false);
-      } else {
-          // KEYWORD SEARCH LOGIC UPDATE: Video-Level AND Logic
-          const keywords = searchQuery.trim().toLowerCase().split(/\s+/);
-          const results: SearchResult[] = [];
-
-          videos.forEach(video => {
-              // 1. First, check if the VIDEO contains ALL keywords anywhere in its transcript
-              const fullTranscriptText = video.transcript.map(t => t.text).join(' ').toLowerCase();
-              const videoMatchesAllKeywords = keywords.every(k => fullTranscriptText.includes(k));
-
-              if (videoMatchesAllKeywords) {
-                  // 2. If the video is a match, collect all segments that contain ANY of the keywords
-                  // This allows the user to jump to any relevant part of the matched video
-                  video.transcript.forEach(segment => {
-                      const text = segment.text.toLowerCase();
-                      if (keywords.some(k => text.includes(k))) {
-                          results.push({ video, segment });
-                      }
-                  });
-              }
-          });
-          
-          setSearchResults(results);
       }
   };
 
   const handleLogout = () => {
-    // Explicitly clear remember me token so we don't auto-login immediately
     MockDB.clearRememberedUser();
-    
     setCurrentUser(null);
-    setSelectedVideo(null);
-    setSearchQuery('');
-    setIsAiSearch(false);
-    setActiveSegmentIndex(-1);
   };
 
   const handleSeek = (seconds: number) => {
@@ -1264,339 +1316,152 @@ const App = () => {
     }
   };
   
-  // New Function for Immediate File Load
   const handleImmediateFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
       const file = e.target.files?.[0];
       if (file && selectedVideo) {
            const url = URL.createObjectURL(file);
-           const updatedVideos = videos.map(v => 
-             v.id === selectedVideo.id ? { ...v, dataUrl: url } : v
-           );
-           setVideos(updatedVideos);
-           
-           // Update current selected object reference to trigger re-render
-           const updatedVideo = updatedVideos.find(v => v.id === selectedVideo.id);
-           if (updatedVideo) setSelectedVideo(updatedVideo);
+           if (dbMode === 'local') {
+               // Update local state
+               setVideos(prev => prev.map(v => v.id === selectedVideo.id ? { ...v, dataUrl: url } : v));
+           }
+           // For both modes, update current selection reference to play immediately
+           setSelectedVideo(prev => prev ? { ...prev, dataUrl: url } : null);
       }
   };
   
-  const handleSearchResultClick = (result: SearchResult) => {
-      setSelectedVideo(result.video);
-      
-      // Find index for transcript scrolling
-      const index = result.video.transcript.findIndex(t => t.startTime === result.segment.startTime);
-      if (index !== -1) {
-          setActiveSegmentIndex(index);
+  const handleSearchResultClick = async (result: SearchResult) => {
+      // If using Supabase, we might not have the full transcript yet
+      if (dbMode === 'supabase' && (!result.video.transcript || result.video.transcript.length === 0)) {
+           // Fetch full transcript on demand
+           const fullTranscript = await SupabaseService.fetchTranscript(result.video.id);
+           result.video.transcript = fullTranscript;
       }
 
+      setSelectedVideo(result.video);
+      
+      const index = result.video.transcript.findIndex(t => t.startTime === result.segment.startTime);
+      if (index !== -1) setActiveSegmentIndex(index);
       setTimeout(() => handleSeek(result.segment.seconds), 100);
   };
 
-  const getVideoSource = (video: VideoData | null): string | undefined => {
-      if (!video) return undefined;
-      return video.publicUrl || video.dataUrl;
-  };
-
-  if (!currentUser) {
-    return <AuthScreen onLogin={setCurrentUser} />;
-  }
+  if (!currentUser) return <AuthScreen onLogin={setCurrentUser} />;
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-200 font-sans">
-      {/* Header */}
       <header className="bg-slate-900 border-b border-slate-800 sticky top-0 z-40">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="bg-indigo-600 p-2 rounded-lg">
-              <span className="text-white"><Database className="w-5 h-5" /></span>
-            </div>
-            <div className="flex flex-col">
-              <h1 className="text-xl font-bold text-white tracking-tight leading-none">视频智搜</h1>
-              <div className="flex items-center gap-2">
-                 <span className="text-[10px] text-slate-500 font-mono">
-                   数据源: {loadingVideos ? '加载中...' : dbSource === 'remote' ? '远程' : '本地'}
-                 </span>
-                 {fetchError && (
-                   <span className="text-[10px] text-red-400 bg-red-900/20 px-1 rounded flex items-center gap-1" title={fetchError}>
-                     <AlertCircle className="w-3 h-3" /> 连接错误
-                   </span>
-                 )}
-              </div>
+            <div className="bg-indigo-600 p-2 rounded-lg"><Database className="w-5 h-5 text-white" /></div>
+            <div>
+              <h1 className="text-xl font-bold text-white leading-none">视频智搜</h1>
+              <span className="text-[10px] text-slate-500 font-mono flex items-center gap-1">
+                 {dbMode === 'supabase' ? <span className="text-green-400 flex items-center gap-1"><Cloud className="w-3 h-3"/> 云端数据库</span> : '本地/远程文件模式'}
+              </span>
             </div>
           </div>
-          
           <div className="flex items-center gap-4">
-            <div className="flex items-center gap-2 px-3 py-1 bg-slate-800 rounded-full border border-slate-700">
-              <span className="text-slate-400"><User className="w-4 h-4" /></span>
-              <span className="text-sm font-medium text-slate-300">{currentUser.username}</span>
-              <span className="text-xs bg-slate-700 px-2 py-0.5 rounded text-slate-400 uppercase">{currentUser.role === 'admin' ? '管理员' : '用户'}</span>
-            </div>
-
-            {currentUser.role === 'admin' && (
-              <button 
-                onClick={() => setShowAdmin(true)}
-                className="p-2 hover:bg-slate-800 rounded-full text-indigo-400 hover:text-indigo-300 transition"
-                title="管理后台"
-              >
-                <span className="text-indigo-400 hover:text-indigo-300"><Settings className="w-5 h-5" /></span>
+             <div className="flex items-center gap-2 mr-2">
+                 <div className="w-8 h-8 rounded-full bg-indigo-500/20 flex items-center justify-center text-indigo-400 font-bold border border-indigo-500/30">
+                     {currentUser.username.substring(0,2).toUpperCase()}
+                 </div>
+                 <span className="text-sm text-slate-300 font-medium hidden md:block">{currentUser.username}</span>
+             </div>
+             {currentUser.role === 'admin' && (
+              <button onClick={() => setShowAdmin(true)} className="p-2 hover:bg-slate-800 rounded-full text-indigo-400 hover:text-indigo-300 transition" title="设置">
+                <Settings className="w-5 h-5" />
               </button>
             )}
-            
-            <button 
-              onClick={handleLogout}
-              className="p-2 hover:bg-slate-800 rounded-full text-slate-400 hover:text-white transition"
-              title="退出登录"
-            >
-              <span className="text-slate-400 hover:text-white"><LogOut className="w-5 h-5" /></span>
+            <button onClick={handleLogout} className="p-2 hover:bg-slate-800 rounded-full text-slate-400 hover:text-white transition" title="退出登录">
+              <LogOut className="w-5 h-5" />
             </button>
           </div>
         </div>
       </header>
 
-      {/* Main Content */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        
-        {!loadingVideos && videos.length === 0 && (
-          <div className="mb-8 p-4 bg-yellow-500/10 border border-yellow-500/20 rounded-lg text-yellow-200 flex items-start gap-3">
-             <span className="text-yellow-200 mt-0.5 shrink-0"><Database className="w-5 h-5" /></span>
-             <div>
-               <h3 className="font-bold">数据库为空</h3>
-               <p className="text-sm opacity-90 mt-1">
-                 未加载任何视频。
-                 {currentUser.role === 'admin' 
-                    ? " 请前往管理后台 → 数据库配置，配置远程 URL 或批量生成本地内容。" 
-                    : " 请联系管理员上传内容。"}
-               </p>
-               {fetchError && <p className="text-xs text-red-300 mt-2 font-mono bg-red-900/20 p-2 rounded">{fetchError}</p>}
-             </div>
-          </div>
-        )}
-
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-          {/* Left Column: Search */}
+          {/* Search Column */}
           <div className="lg:col-span-1 space-y-6">
             <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg">
               <div className="flex justify-between items-center mb-4">
                   <h2 className="text-lg font-semibold text-white">内容搜索</h2>
-                  <button 
-                    onClick={() => setIsAiSearch(!isAiSearch)}
-                    className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-bold transition border ${
-                        isAiSearch 
-                        ? 'bg-indigo-600 text-white border-indigo-500 shadow-[0_0_15px_rgba(79,70,229,0.5)]' 
-                        : 'bg-slate-700 text-slate-400 border-slate-600 hover:bg-slate-600'
-                    }`}
-                  >
-                    <span className={isAiSearch ? 'text-white' : 'text-slate-400'}><Sparkles className="w-3 h-3" /></span>
-                    {isAiSearch ? 'AI 模式' : '关键词模式'}
+                  <button onClick={() => setIsAiSearch(!isAiSearch)} className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-bold transition border ${isAiSearch ? 'bg-indigo-600 text-white border-indigo-500' : 'bg-slate-700 text-slate-400 border-slate-600'}`}>
+                    <Sparkles className="w-3 h-3" /> {isAiSearch ? 'AI 模式' : '关键词'}
                   </button>
               </div>
-              
               <div className="relative">
-                {isSearching ? (
-                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-indigo-400"><Loader2 className="w-5 h-5 animate-spin" /></span>
-                ) : (
-                    <span className={`absolute left-3 top-1/2 -translate-y-1/2 ${isAiSearch ? 'text-indigo-400' : 'text-slate-400'}`}><Search className="w-5 h-5" /></span>
-                )}
-                <input 
-                  type="text" 
-                  placeholder={isAiSearch ? "输入问题 (例如: '如何处理投诉?')" : "搜索视频对话内容..."}
-                  className={`w-full bg-slate-900 border pl-10 pr-4 py-3 rounded-lg text-white outline-none transition ${
-                      isAiSearch 
-                      ? 'border-indigo-500/50 focus:ring-2 focus:ring-indigo-500' 
-                      : 'border-slate-700 focus:ring-2 focus:ring-indigo-500 focus:border-transparent'
-                  }`}
-                  value={searchQuery}
-                  onChange={e => setSearchQuery(e.target.value)}
-                />
+                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400">{isSearching ? <Loader2 className="w-5 h-5 animate-spin"/> : <Search className="w-5 h-5"/>}</span>
+                <input type="text" placeholder={isAiSearch ? "输入问题..." : "搜索关键词..."} 
+                    className="w-full bg-slate-900 border border-slate-700 pl-10 pr-4 py-3 rounded-lg text-white outline-none focus:border-indigo-500"
+                    value={searchQuery} onChange={e => setSearchQuery(e.target.value)} />
               </div>
-
-              {!isAiSearch && (
-                  <p className="text-[10px] text-slate-500 mt-2 leading-relaxed">
-                      小提示：您可以输入多个关键词（空格分隔），系统会自动查找<strong className="text-indigo-400">整个视频</strong>中同时包含这些词的内容。
-                  </p>
-              )}
             </div>
 
             <div className="space-y-4">
-              {searchQuery.length > 1 && searchResults.length === 0 && !isSearching && (
-                 <div className="text-center py-10 text-slate-500">
-                   未找到与 "{searchQuery}" 相关的内容
-                 </div>
-              )}
-              
               {searchResults.map((result, idx) => (
-                <div 
-                  key={idx}
-                  onClick={() => handleSearchResultClick(result)}
-                  className={`border p-4 rounded-lg cursor-pointer transition group relative overflow-hidden ${
-                      result.isAiMatch 
-                      ? 'bg-indigo-900/10 border-indigo-500/30 hover:bg-indigo-900/20' 
-                      : 'bg-slate-800/50 hover:bg-slate-800 border-slate-700/50'
-                  }`}
-                >
-                  {result.isAiMatch && (
-                      <div className="absolute top-0 right-0 p-1">
-                          <span className="text-indigo-400 opacity-50"><Sparkles className="w-3 h-3" /></span>
-                      </div>
-                  )}
+                <div key={idx} onClick={() => handleSearchResultClick(result)}
+                  className={`border p-4 rounded-lg cursor-pointer transition relative overflow-hidden ${result.isAiMatch ? 'bg-indigo-900/10 border-indigo-500/30' : 'bg-slate-800/50 border-slate-700/50 hover:bg-slate-800'}`}>
                   <div className="flex justify-between items-start mb-2">
-                    <span className={`text-xs font-medium px-2 py-0.5 rounded ${
-                        result.isAiMatch ? 'bg-indigo-500 text-white' : 'text-indigo-400 bg-indigo-400/10'
-                    }`}>
-                      {result.segment.startTime}
-                    </span>
-                    <div className="flex items-center gap-2">
-                         {result.video.publicUrl && (
-                             <span title="远程视频" className="text-sky-400">
-                               <Cloud className="w-3 h-3" />
-                             </span>
-                         )}
-                         {!result.video.publicUrl && (
-                             <span title="本地视频" className="text-slate-500">
-                               <HardDrive className="w-3 h-3" />
-                             </span>
-                         )}
-                    </div>
+                    <span className="text-xs font-medium px-2 py-0.5 rounded text-indigo-400 bg-indigo-400/10">{result.segment.startTime}</span>
+                    <span className="text-slate-500"><HardDrive className="w-3 h-3" /></span>
                   </div>
-                  
-                  {/* AI Reasoning display */}
-                  {result.aiReasoning && (
-                      <div className="mb-2 text-xs text-indigo-300 italic border-l-2 border-indigo-500 pl-2">
-                          "{result.aiReasoning}"
-                      </div>
-                  )}
-                  
-                  <p className="text-slate-200 text-sm leading-relaxed mb-2">
-                    "... <span className={isAiSearch ? '' : "text-white font-medium bg-indigo-600/20"}>{result.segment.text}</span> ..."
-                  </p>
+                  <p className="text-slate-200 text-sm leading-relaxed mb-2">"... <span className={!isAiSearch ? "text-white font-medium bg-indigo-600/20" : ""}>{result.segment.text}</span> ..."</p>
                   <p className="text-xs text-slate-500 truncate">{result.video.title}</p>
                 </div>
               ))}
             </div>
           </div>
 
-          {/* Right Column: Player (Unified Layout) */}
+          {/* Player Column */}
           <div className="lg:col-span-2">
             <div className="bg-black rounded-xl overflow-hidden shadow-2xl border border-slate-800 sticky top-24">
                 <div className="aspect-video bg-black relative flex items-center justify-center border-b border-slate-800">
-                  {selectedVideo && getVideoSource(selectedVideo) ? (
-                    <video 
-                      ref={videoRef}
-                      src={getVideoSource(selectedVideo)} 
-                      controls 
-                      className="w-full h-full"
-                    />
+                  {selectedVideo && (selectedVideo.publicUrl || selectedVideo.dataUrl) ? (
+                    <video ref={videoRef} src={selectedVideo.publicUrl || selectedVideo.dataUrl} controls className="w-full h-full" />
                   ) : selectedVideo ? (
-                    <div className="text-center p-8 max-w-md animate-in fade-in zoom-in duration-300">
-                      <div className="bg-slate-800 p-4 rounded-full inline-block mb-4">
-                        <span className="text-indigo-400"><HardDrive className="w-8 h-8" /></span>
-                      </div>
+                    <div className="text-center p-8 max-w-md">
+                      <div className="bg-slate-800 p-4 rounded-full inline-block mb-4"><HardDrive className="w-8 h-8 text-indigo-400" /></div>
                       <h3 className="text-xl font-bold text-white mb-2">需要本地文件</h3>
-                      <p className="text-slate-400 text-sm mb-6">
-                        此视频未在线托管。请从您的电脑中选择文件 
-                        <strong> {selectedVideo.fileName}</strong> 进行播放。
-                      </p>
-                      
-                      <div className="space-y-3">
-                         <div className="flex justify-center">
-                             <input 
-                                type="file" 
-                                accept="video/*"
-                                onChange={handleImmediateFileSelect}
-                                className="block w-full text-sm text-slate-400
-                                file:mr-4 file:py-2 file:px-4
-                                file:rounded-full file:border-0
-                                file:text-xs file:font-semibold
-                                file:bg-indigo-600 file:text-white
-                                hover:file:bg-indigo-500
-                                cursor-pointer bg-slate-900 rounded-full border border-slate-700 max-w-[250px]"
-                            />
-                         </div>
-                         <p className="text-[10px] text-slate-500">选择文件后立即播放</p>
+                      <p className="text-slate-400 text-sm mb-6">请选择文件 <strong> {selectedVideo.fileName}</strong> 进行播放。</p>
+                      <div className="flex flex-col items-center gap-2">
+                         <input type="file" accept="video/*" onChange={handleImmediateFileSelect} className="block w-full text-sm text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-xs file:font-semibold file:bg-indigo-600 file:text-white hover:file:bg-indigo-500 cursor-pointer bg-slate-900 rounded-full border border-slate-700 max-w-[250px]" />
+                         <p className="text-[10px] text-indigo-400/80 mt-2 bg-slate-800/50 p-2 rounded border border-indigo-500/10">提示：上传对应视频后点击搜索结果或者下方文案即可跳转。</p>
                       </div>
                     </div>
                   ) : (
-                      // Empty State inside the player frame
-                      <div className="text-slate-600 flex flex-col items-center">
-                          <Play className="w-12 h-12 opacity-20 mb-2" />
-                          <span className="text-sm opacity-40">请点击左侧结果播放</span>
-                      </div>
+                      <div className="text-slate-600 flex flex-col items-center"><Play className="w-12 h-12 opacity-20 mb-2" /><span className="text-sm opacity-40">请点击左侧结果播放</span></div>
                   )}
                 </div>
                 
                 <div className="p-6 bg-slate-800 h-[400px] flex flex-col">
                   {selectedVideo ? (
                       <>
-                        <div className="flex justify-between items-start mb-2">
-                            <h2 className="text-xl font-bold text-white truncate pr-4">{selectedVideo.title}</h2>
-                            {selectedVideo.publicUrl && (
-                                <span className="text-xs bg-sky-500/20 text-sky-400 px-2 py-1 rounded flex items-center gap-1 shrink-0">
-                                    <Cloud className="w-3 h-3" /> 远程资源
-                                </span>
-                            )}
-                        </div>
-                        
-                        <div className="flex gap-4 text-sm text-slate-400 mb-6">
-                            <span>上传时间: {selectedVideo.uploadDate}</span>
-                            <span>ID: <span className="font-mono text-xs">{selectedVideo.id.split('_')[1] || '...'}</span></span>
-                        </div>
+                        <h2 className="text-xl font-bold text-white truncate mb-1">{selectedVideo.title}</h2>
+                        <div className="flex gap-4 text-sm text-slate-400 mb-6"><span>ID: {selectedVideo.id.split('_')[1] || '...'}</span></div>
                       </>
-                  ) : (
-                      <div className="mb-8 border-b border-slate-700/50 pb-4">
-                          <div className="h-6 w-1/3 bg-slate-700/50 rounded animate-pulse mb-2"></div>
-                          <div className="h-4 w-1/4 bg-slate-700/30 rounded animate-pulse"></div>
-                      </div>
-                  )}
+                  ) : <div className="mb-8 border-b border-slate-700/50 pb-4 h-10 animate-pulse bg-slate-700/20 rounded"></div>}
                   
-                  <div className="flex justify-between items-center mb-3">
-                      <h3 className="text-sm font-semibold text-white uppercase tracking-wider">全文记录</h3>
-                  </div>
-
-                  {/* Transcript Container - Always Rendered */}
-                  <div 
-                    ref={transcriptRef}
-                    className="flex-1 overflow-y-auto space-y-1 pr-2 custom-scrollbar scroll-smooth bg-slate-900/50 rounded-lg p-2 border border-slate-700/50"
-                  >
-                    {selectedVideo ? selectedVideo.transcript.map((t, i) => (
-                      <div 
-                        key={i} 
-                        onClick={() => {
-                            setActiveSegmentIndex(i);
-                            if (getVideoSource(selectedVideo)) handleSeek(t.seconds);
-                        }}
-                        className={`flex gap-4 p-2 rounded cursor-pointer group text-sm transition-colors border-l-2 ${
-                           activeSegmentIndex === i 
-                           ? 'bg-indigo-600/20 border-indigo-500' 
-                           : 'border-transparent hover:bg-slate-700/50'
-                        }`}
-                      >
-                        <span className={`font-mono min-w-[50px] text-xs pt-0.5 ${
-                            activeSegmentIndex === i ? 'text-indigo-300 font-bold' : 'text-slate-600 group-hover:text-indigo-400'
-                        }`}>
-                          {t.startTime}
-                        </span>
-                        <p className={`${
-                            activeSegmentIndex === i ? 'text-white' : 'text-slate-400 group-hover:text-slate-200'
-                        }`}>
-                          {t.text}
-                        </p>
+                  <h3 className="text-sm font-semibold text-white uppercase tracking-wider mb-3">全文记录</h3>
+                  <div ref={transcriptRef} className="flex-1 overflow-y-auto space-y-1 pr-2 custom-scrollbar scroll-smooth bg-slate-900/50 rounded-lg p-2 border border-slate-700/50">
+                    {selectedVideo?.transcript?.map((t, i) => (
+                      <div key={i} onClick={() => { setActiveSegmentIndex(i); if (selectedVideo.dataUrl || selectedVideo.publicUrl) handleSeek(t.seconds); }}
+                        className={`flex gap-4 p-2 rounded cursor-pointer group text-sm transition-colors border-l-2 ${activeSegmentIndex === i ? 'bg-indigo-600/20 border-indigo-500' : 'border-transparent hover:bg-slate-700/50'}`}>
+                        <span className={`font-mono min-w-[50px] text-xs pt-0.5 ${activeSegmentIndex === i ? 'text-indigo-300 font-bold' : 'text-slate-600'}`}>{t.startTime}</span>
+                        <p className={activeSegmentIndex === i ? 'text-white' : 'text-slate-400'}>{t.text}</p>
                       </div>
-                    )) : (
-                        <div className="flex items-center justify-center h-full text-slate-600 text-sm">
-                            暂无内容
-                        </div>
-                    )}
+                    )) || <div className="text-center text-slate-600 text-sm mt-10">暂无内容</div>}
                   </div>
                 </div>
               </div>
           </div>
         </div>
       </main>
-
-      {showAdmin && <AdminPanel onClose={() => setShowAdmin(false)} onDbUpdate={fetchVideos} />}
+      {showAdmin && <AdminPanel onClose={() => setShowAdmin(false)} onDbUpdate={initData} />}
     </div>
   );
 };
 
-// Export App component for Vite local development
 export default App;
+
+const container = document.getElementById('app');
+if (container) { createRoot(container).render(<App />); }
