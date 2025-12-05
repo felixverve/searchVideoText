@@ -23,7 +23,9 @@ import {
   Trash2,
   Globe,
   Flag,
-  BookOpen
+  BookOpen,
+  Edit3,
+  Save
 } from 'lucide-react';
 
 // --- Types ---
@@ -37,6 +39,7 @@ interface UserAccount {
   password: string; // In a real app, this would be hashed!
   role: UserRole;
   status: UserStatus;
+  note?: string; // New field for admin notes
 }
 
 interface TranscriptSegment {
@@ -89,7 +92,8 @@ const MockDB = {
         username: 'admin',
         password: 'admin',
         role: 'admin',
-        status: 'active'
+        status: 'active',
+        note: 'Super Admin'
       };
       localStorage.setItem(DB_KEYS.USERS, JSON.stringify([defaultAdmin]));
     }
@@ -112,13 +116,25 @@ const MockDB = {
 
   saveUser: (user: UserAccount) => {
     const users = MockDB.getUsers();
-    users.push(user);
+    // Check if update or new
+    const idx = users.findIndex(u => u.id === user.id);
+    if (idx >= 0) {
+        users[idx] = user;
+    } else {
+        users.push(user);
+    }
     localStorage.setItem(DB_KEYS.USERS, JSON.stringify(users));
   },
 
   updateUserStatus: (userId: string, status: UserStatus) => {
     const users = MockDB.getUsers();
     const updated = users.map(u => u.id === userId ? { ...u, status } : u);
+    localStorage.setItem(DB_KEYS.USERS, JSON.stringify(updated));
+  },
+
+  updateUserNote: (userId: string, note: string) => {
+    const users = MockDB.getUsers();
+    const updated = users.map(u => u.id === userId ? { ...u, note } : u);
     localStorage.setItem(DB_KEYS.USERS, JSON.stringify(updated));
   },
   
@@ -374,23 +390,31 @@ const cozeSearch = async (
 };
 
 const fallbackSearch = (query: string, localVideos: VideoData[]): SearchResult[] => {
-    const keywords = query.toLowerCase().split(' ');
+    // New Logic for Fallback (Video-level AND)
+    const keywords = query.toLowerCase().split(/\s+/);
     const results: SearchResult[] = [];
     
     localVideos.forEach(video => {
-      video.transcript.forEach(segment => {
-        const text = segment.text.toLowerCase();
-        if (keywords.some(k => text.includes(k))) {
-          results.push({
-            video,
-            segment,
-            isAiMatch: true,
-            aiReasoning: `关键词模拟匹配: ${text}`
+      // 1. Check video level match first (Video contains ALL keywords)
+      const fullText = video.transcript.map(t => t.text).join(' ').toLowerCase();
+      const isVideoMatch = keywords.every(k => fullText.includes(k));
+
+      if (isVideoMatch) {
+          // 2. If video matches, return segments that contain ANY of the keywords
+          video.transcript.forEach(segment => {
+            const text = segment.text.toLowerCase();
+            if (keywords.some(k => text.includes(k))) {
+              results.push({
+                video,
+                segment,
+                isAiMatch: true,
+                aiReasoning: `全匹配视频中的片段`
+              });
+            }
           });
-        }
-      });
+      }
     });
-    return results.slice(0, 5);
+    return results;
 }
 
 // --- Components ---
@@ -445,7 +469,8 @@ const AuthScreen = ({ onLogin }: { onLogin: (user: UserAccount) => void }) => {
         username,
         password,
         role: 'user',
-        status: 'pending'
+        status: 'pending',
+        note: ''
       };
       MockDB.saveUser(newUser);
       setSuccess('注册成功！请等待管理员审核。');
@@ -798,6 +823,11 @@ const AdminPanel = ({ onClose, onDbUpdate }: { onClose: () => void, onDbUpdate: 
     MockDB.updateUserStatus(userId, newStatus);
     setUsers(MockDB.getUsers());
   };
+  
+  const handleNoteBlur = (userId: string, newNote: string) => {
+      MockDB.updateUserNote(userId, newNote);
+      setUsers(MockDB.getUsers());
+  };
 
   const handleSaveSettings = () => {
     MockDB.saveSettings(settings);
@@ -867,6 +897,7 @@ JSON 格式示例:
                 <tr>
                   <th className="px-4 py-3 rounded-tl-lg">用户名</th>
                   <th className="px-4 py-3">角色</th>
+                  <th className="px-4 py-3">备注</th>
                   <th className="px-4 py-3">状态</th>
                   <th className="px-4 py-3 rounded-tr-lg">操作</th>
                 </tr>
@@ -876,6 +907,15 @@ JSON 格式示例:
                   <tr key={user.id} className="border-b border-slate-700 hover:bg-slate-700/50">
                     <td className="px-4 py-3 font-medium text-white">{user.username}</td>
                     <td className="px-4 py-3">{user.role === 'admin' ? '管理员' : '用户'}</td>
+                    <td className="px-4 py-3">
+                        <input 
+                            type="text" 
+                            defaultValue={user.note || ''}
+                            onBlur={(e) => handleNoteBlur(user.id, e.target.value)}
+                            placeholder="点击添加备注..."
+                            className="bg-transparent border border-transparent hover:border-slate-600 focus:border-indigo-500 rounded px-2 py-1 w-full text-xs text-slate-300 outline-none"
+                        />
+                    </td>
                     <td className="px-4 py-3">
                       <span className={`px-2 py-1 rounded-full text-xs font-bold ${
                         user.status === 'active' ? 'bg-green-500/20 text-green-400' :
@@ -1114,12 +1154,15 @@ const App = () => {
   useEffect(() => {
     if (activeSegmentIndex !== -1 && transcriptRef.current) {
         // Try to access the child element safely
-        const child = transcriptRef.current.children[activeSegmentIndex] as HTMLElement;
-        if (child) {
-            child.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        }
+        // Wait a tick for DOM update if switching videos
+        setTimeout(() => {
+            const child = transcriptRef.current?.children[activeSegmentIndex] as HTMLElement;
+            if (child) {
+                child.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+        }, 100);
     }
-  }, [activeSegmentIndex]);
+  }, [activeSegmentIndex, selectedVideo]); // Add selectedVideo as dep to trigger scroll on video switch
 
   const fetchVideos = async () => {
     setLoadingVideos(true);
@@ -1180,18 +1223,27 @@ const App = () => {
           setSearchResults(results);
           setIsSearching(false);
       } else {
-          // KEYWORD SEARCH LOGIC UPDATE: AND Logic (Space linkage)
+          // KEYWORD SEARCH LOGIC UPDATE: Video-Level AND Logic
           const keywords = searchQuery.trim().toLowerCase().split(/\s+/);
+          const results: SearchResult[] = [];
+
+          videos.forEach(video => {
+              // 1. First, check if the VIDEO contains ALL keywords anywhere in its transcript
+              const fullTranscriptText = video.transcript.map(t => t.text).join(' ').toLowerCase();
+              const videoMatchesAllKeywords = keywords.every(k => fullTranscriptText.includes(k));
+
+              if (videoMatchesAllKeywords) {
+                  // 2. If the video is a match, collect all segments that contain ANY of the keywords
+                  // This allows the user to jump to any relevant part of the matched video
+                  video.transcript.forEach(segment => {
+                      const text = segment.text.toLowerCase();
+                      if (keywords.some(k => text.includes(k))) {
+                          results.push({ video, segment });
+                      }
+                  });
+              }
+          });
           
-          const results = videos.flatMap(video => 
-            video.transcript
-              .filter(t => {
-                  const text = t.text.toLowerCase();
-                  // Returns true only if ALL keywords are present in the text segment
-                  return keywords.every(k => text.includes(k));
-              })
-              .map(t => ({ video, segment: t }))
-          );
           setSearchResults(results);
       }
   };
@@ -1242,7 +1294,8 @@ const App = () => {
       setTimeout(() => handleSeek(result.segment.seconds), 100);
   };
 
-  const getVideoSource = (video: VideoData): string | undefined => {
+  const getVideoSource = (video: VideoData | null): string | undefined => {
+      if (!video) return undefined;
       return video.publicUrl || video.dataUrl;
   };
 
@@ -1361,7 +1414,7 @@ const App = () => {
 
               {!isAiSearch && (
                   <p className="text-[10px] text-slate-500 mt-2 leading-relaxed">
-                      小提示：您可以输入多个关键词，中间用空格分割，比如：<span className="text-indigo-400 font-medium bg-indigo-900/20 px-1 rounded mx-1">未来十年 确定性 普通人 机会</span>，搜索结果更精准（中间一定要有空格哦）。
+                      小提示：您可以输入多个关键词（空格分隔），系统会自动查找<strong className="text-indigo-400">整个视频</strong>中同时包含这些词的内容。
                   </p>
               )}
             </div>
@@ -1424,20 +1477,19 @@ const App = () => {
             </div>
           </div>
 
-          {/* Right Column: Player */}
+          {/* Right Column: Player (Unified Layout) */}
           <div className="lg:col-span-2">
-            {selectedVideo ? (
-              <div className="bg-black rounded-xl overflow-hidden shadow-2xl border border-slate-800 sticky top-24">
-                <div className="aspect-video bg-black relative flex items-center justify-center">
-                  {getVideoSource(selectedVideo) ? (
+            <div className="bg-black rounded-xl overflow-hidden shadow-2xl border border-slate-800 sticky top-24">
+                <div className="aspect-video bg-black relative flex items-center justify-center border-b border-slate-800">
+                  {selectedVideo && getVideoSource(selectedVideo) ? (
                     <video 
                       ref={videoRef}
                       src={getVideoSource(selectedVideo)} 
                       controls 
                       className="w-full h-full"
                     />
-                  ) : (
-                    <div className="text-center p-8 max-w-md">
+                  ) : selectedVideo ? (
+                    <div className="text-center p-8 max-w-md animate-in fade-in zoom-in duration-300">
                       <div className="bg-slate-800 p-4 rounded-full inline-block mb-4">
                         <span className="text-indigo-400"><HardDrive className="w-8 h-8" /></span>
                       </div>
@@ -1465,35 +1517,49 @@ const App = () => {
                          <p className="text-[10px] text-slate-500">选择文件后立即播放</p>
                       </div>
                     </div>
+                  ) : (
+                      // Empty State inside the player frame
+                      <div className="text-slate-600 flex flex-col items-center">
+                          <Play className="w-12 h-12 opacity-20 mb-2" />
+                          <span className="text-sm opacity-40">请点击左侧结果播放</span>
+                      </div>
                   )}
                 </div>
-                <div className="p-6 bg-slate-800">
-                  <div className="flex justify-between items-start mb-2">
-                     <h2 className="text-xl font-bold text-white">{selectedVideo.title}</h2>
-                     {selectedVideo.publicUrl && (
-                         <span className="text-xs bg-sky-500/20 text-sky-400 px-2 py-1 rounded flex items-center gap-1">
-                             <Cloud className="w-3 h-3" /> 远程资源
-                         </span>
-                     )}
-                  </div>
-                  
-                  <div className="flex gap-4 text-sm text-slate-400 mb-6">
-                    <span>上传时间: {selectedVideo.uploadDate}</span>
-                    <span>ID: {selectedVideo.id}</span>
-                  </div>
+                
+                <div className="p-6 bg-slate-800 h-[400px] flex flex-col">
+                  {selectedVideo ? (
+                      <>
+                        <div className="flex justify-between items-start mb-2">
+                            <h2 className="text-xl font-bold text-white truncate pr-4">{selectedVideo.title}</h2>
+                            {selectedVideo.publicUrl && (
+                                <span className="text-xs bg-sky-500/20 text-sky-400 px-2 py-1 rounded flex items-center gap-1 shrink-0">
+                                    <Cloud className="w-3 h-3" /> 远程资源
+                                </span>
+                            )}
+                        </div>
+                        
+                        <div className="flex gap-4 text-sm text-slate-400 mb-6">
+                            <span>上传时间: {selectedVideo.uploadDate}</span>
+                            <span>ID: <span className="font-mono text-xs">{selectedVideo.id.split('_')[1] || '...'}</span></span>
+                        </div>
+                      </>
+                  ) : (
+                      <div className="mb-8 border-b border-slate-700/50 pb-4">
+                          <div className="h-6 w-1/3 bg-slate-700/50 rounded animate-pulse mb-2"></div>
+                          <div className="h-4 w-1/4 bg-slate-700/30 rounded animate-pulse"></div>
+                      </div>
+                  )}
                   
                   <div className="flex justify-between items-center mb-3">
                       <h3 className="text-sm font-semibold text-white uppercase tracking-wider">全文记录</h3>
-                      <p className="text-xs text-indigo-300 bg-indigo-900/30 px-2 py-1 rounded border border-indigo-500/30">
-                          提示：上传对应视频后点击搜索结果或者下方文案即可跳转到视频对应的时间点。
-                      </p>
                   </div>
 
+                  {/* Transcript Container - Always Rendered */}
                   <div 
                     ref={transcriptRef}
-                    className="h-64 overflow-y-auto space-y-1 pr-2 custom-scrollbar scroll-smooth"
+                    className="flex-1 overflow-y-auto space-y-1 pr-2 custom-scrollbar scroll-smooth bg-slate-900/50 rounded-lg p-2 border border-slate-700/50"
                   >
-                    {selectedVideo.transcript.map((t, i) => (
+                    {selectedVideo ? selectedVideo.transcript.map((t, i) => (
                       <div 
                         key={i} 
                         onClick={() => {
@@ -1503,30 +1569,28 @@ const App = () => {
                         className={`flex gap-4 p-2 rounded cursor-pointer group text-sm transition-colors border-l-2 ${
                            activeSegmentIndex === i 
                            ? 'bg-indigo-600/20 border-indigo-500' 
-                           : 'border-transparent hover:bg-slate-700'
+                           : 'border-transparent hover:bg-slate-700/50'
                         }`}
                       >
-                        <span className={`font-mono min-w-[50px] ${
-                            activeSegmentIndex === i ? 'text-indigo-300 font-bold' : 'text-slate-500 group-hover:text-indigo-400'
+                        <span className={`font-mono min-w-[50px] text-xs pt-0.5 ${
+                            activeSegmentIndex === i ? 'text-indigo-300 font-bold' : 'text-slate-600 group-hover:text-indigo-400'
                         }`}>
                           {t.startTime}
                         </span>
                         <p className={`${
-                            activeSegmentIndex === i ? 'text-white' : 'text-slate-300 group-hover:text-white'
+                            activeSegmentIndex === i ? 'text-white' : 'text-slate-400 group-hover:text-slate-200'
                         }`}>
                           {t.text}
                         </p>
                       </div>
-                    ))}
+                    )) : (
+                        <div className="flex items-center justify-center h-full text-slate-600 text-sm">
+                            暂无内容
+                        </div>
+                    )}
                   </div>
                 </div>
               </div>
-            ) : (
-              <div className="h-full min-h-[400px] flex flex-col items-center justify-center bg-slate-800/30 rounded-xl border border-slate-800 border-dashed text-slate-500">
-                <span className="text-slate-500 opacity-20"><Play className="w-16 h-16 mb-4" /></span>
-                <p>点击左侧搜索结果开始播放</p>
-              </div>
-            )}
           </div>
         </div>
       </main>
