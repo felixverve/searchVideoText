@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
+import { createClient } from '@supabase/supabase-js';
 
 import { 
   Search, 
@@ -26,15 +27,6 @@ import {
   Users,
   Info
 } from 'lucide-react';
-
-// --- Global Types for UMD libs ---
-declare global {
-  interface Window {
-    supabase: {
-      createClient: (url: string, key: string) => any;
-    };
-  }
-}
 
 // --- Types ---
 
@@ -256,11 +248,12 @@ const parseSubtitleFile = (content: string): TranscriptSegment[] => {
   return segments;
 };
 
-// --- Supabase Service (Defined locally to avoid import errors) ---
+// --- Supabase Service ---
 
 const SupabaseService = {
     getClient: () => {
         const settings = MockDB.getSettings();
+        // Return null immediately if keys are missing to avoid console errors
         if (!settings.supabaseUrl || !settings.supabaseKey) return null;
         
         let url = settings.supabaseUrl.trim();
@@ -285,15 +278,12 @@ const SupabaseService = {
         
         const key = settings.supabaseKey.trim();
 
-        if (window.supabase) {
-            try {
-                return window.supabase.createClient(url, key);
-            } catch (e) {
-                console.error("Supabase Init Failed (Invalid URL/Key):", e);
-                return null;
-            }
+        try {
+            return createClient(url, key);
+        } catch (e) {
+            console.error("Supabase Init Failed (Invalid URL/Key):", e);
+            return null;
         }
-        return null;
     },
 
     getAllVideos: async (): Promise<VideoData[]> => {
@@ -1570,9 +1560,14 @@ const App = () => {
                 <div className="relative flex-1">
                     <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400">{isSearching ? <Loader2 className="w-5 h-5 animate-spin"/> : <Search className="w-5 h-5"/>}</span>
                     <input type="text" placeholder={isAiSearch ? "输入问题..." : "搜索关键词..."} 
-                        className="w-full bg-slate-900 border border-slate-700 pl-10 pr-4 py-3 rounded-lg text-white outline-none focus:border-indigo-500 transition-colors"
+                        className="w-full bg-slate-900 border border-slate-700 pl-10 pr-8 py-3 rounded-lg text-white outline-none focus:border-indigo-500 transition-colors"
                         value={searchQuery} onChange={e => setSearchQuery(e.target.value)} 
                         onKeyDown={(e) => e.key === 'Enter' && handleSearch()} />
+                    {searchQuery && (
+                        <button onClick={() => { setSearchQuery(''); setSearchResults([]); }} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-white">
+                            <XCircle className="w-4 h-4" />
+                        </button>
+                    )}
                 </div>
                 <button 
                     onClick={() => handleSearch()} 
