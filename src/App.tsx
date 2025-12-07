@@ -85,14 +85,14 @@ interface SearchResult {
 // 这样别人打开网页时，会自动使用这些配置，无需再次手动输入。
 const GLOBAL_APP_CONFIG: AppSettings = {
   // Supabase 项目地址 (例如: https://xyz.supabase.co)
-  supabaseUrl: '', 
+  supabaseUrl: 'https://euikwoyohattxfxmrzgt.supabase.co', 
   
   // Supabase API Key (anon/public key)
-  supabaseKey: '',
+  supabaseKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImV1aWt3b3lvaGF0dHhmeG1yemd0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjQ4ODk4NjgsImV4cCI6MjA4MDQ2NTg2OH0.ygURWUh59iYrth-Or4zgNmDl_ygis1qmTkSLO7SpTZE',
   
   // Coze 配置 (可选，如果不填则无法使用 AI 搜索)
-  cozeApiKey: '',
-  cozeBotId: '',
+  cozeApiKey: 'pat_vv2A48hplarHOQclQigwn4HZbZQWolKBIxnsJOhevP2R4gtzzfVOQ7R4pTJqXqmo',
+  cozeBotId: '7579927339174690822',
   cozeBaseUrl: 'https://api.coze.cn',
   
   // 远程 JSON 地址 (可选)
@@ -1693,7 +1693,7 @@ const App = () => {
                   <div className="flex justify-between items-start">
                     <div className="flex items-center gap-2 overflow-hidden mr-2">
                         <FileVideo className="w-4 h-4 text-indigo-400 flex-shrink-0" />
-                        <span className="text-xs font-bold text-slate-300 truncate">{result.video.title}</span>
+                        <span className="text-xs font-bold text-slate-300 whitespace-normal break-all">{result.video.title}</span>
                     </div>
                     <div className="flex items-center gap-1 text-[10px] font-mono text-slate-500 bg-black/20 px-1.5 py-0.5 rounded flex-shrink-0">
                         <Clock className="w-3 h-3" />
