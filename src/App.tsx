@@ -25,7 +25,9 @@ import {
   Trash2,
   Check,
   Users,
-  Info
+  Info,
+  Clock,
+  FileVideo
 } from 'lucide-react';
 
 // --- Types ---
@@ -75,6 +77,7 @@ interface SearchResult {
   isAiMatch?: boolean;
   aiReasoning?: string;
   aiQuote?: string; // Added to support AI quote separation
+  context?: { prev: string; next: string }; // 上下文信息
 }
 
 // --- GLOBAL CONFIGURATION ---
@@ -82,14 +85,14 @@ interface SearchResult {
 // 这样别人打开网页时，会自动使用这些配置，无需再次手动输入。
 const GLOBAL_APP_CONFIG: AppSettings = {
   // Supabase 项目地址 (例如: https://xyz.supabase.co)
-  supabaseUrl: 'https://euikwoyohattxfxmrzgt.supabase.co', 
+  supabaseUrl: '', 
   
   // Supabase API Key (anon/public key)
-  supabaseKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImV1aWt3b3lvaGF0dHhmeG1yemd0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjQ4ODk4NjgsImV4cCI6MjA4MDQ2NTg2OH0.ygURWUh59iYrth-Or4zgNmDl_ygis1qmTkSLO7SpTZE',
+  supabaseKey: '',
   
   // Coze 配置 (可选，如果不填则无法使用 AI 搜索)
-  cozeApiKey: 'pat_vv2A48hplarHOQclQigwn4HZbZQWolKBIxnsJOhevP2R4gtzzfVOQ7R4pTJqXqmo',
-  cozeBotId: '7579927339174690822',
+  cozeApiKey: '',
+  cozeBotId: '',
   cozeBaseUrl: 'https://api.coze.cn',
   
   // 远程 JSON 地址 (可选)
@@ -361,22 +364,44 @@ const SupabaseService = {
             // Build OR filter: text.ilike.%k1%,text.ilike.%k2%
             const orFilter = keywords.map(k => `text.ilike.%${k}%`).join(',');
 
-            // Fetch segments matching ANY keyword
+            // 1. Fetch segments matching ANY keyword
+            // Limit to 100 to avoid performance issues when fetching context for too many items
             const { data, error } = await supabase
                 .from('transcripts')
                 .select(`*, videos (id, title, file_name, upload_date, public_url)`)
                 .or(orFilter)
                 .order('video_id', { ascending: true })
                 .order('seconds', { ascending: true })
-                .limit(2000);
+                .limit(100);
 
             if (error) { 
                 console.warn("Supabase Search Error:", error.message); 
                 return []; 
             }
-            if (!data) return [];
+            if (!data || data.length === 0) return [];
 
-            // Client-side Aggregation
+            // 2. Fetch Context (Previous 6 lines and Next 6 lines)
+            // We assume IDs are sequential for imports. We collect all needed IDs.
+            const neededIds = new Set<number>();
+            data.forEach((row: any) => {
+                for (let i = 1; i <= 6; i++) {
+                    neededIds.add(row.id - i);
+                    neededIds.add(row.id + i);
+                }
+            });
+
+            // Batch fetch neighbor rows
+            const { data: neighbors } = await supabase
+                .from('transcripts')
+                .select('id, text, video_id')
+                .in('id', Array.from(neededIds));
+            
+            const neighborMap = new Map<number, any>();
+            if (neighbors) {
+                neighbors.forEach((n: any) => neighborMap.set(n.id, n));
+            }
+
+            // 3. Client-side Aggregation and Result Building
             const videoGroups = new Map<string, {
                 video: any,
                 segments: any[],
@@ -396,17 +421,12 @@ const SupabaseService = {
                 const group = videoGroups.get(vid)!;
                 const textLower = (row.text || '').toLowerCase();
                 
-                let hasMatch = false;
                 keywords.forEach(k => {
                     if (textLower.includes(k)) {
                         group.matchedKeywords.add(k);
-                        hasMatch = true;
                     }
                 });
-
-                if (hasMatch) {
-                    group.segments.push(row);
-                }
+                group.segments.push(row);
             });
 
             const results: SearchResult[] = [];
@@ -417,6 +437,26 @@ const SupabaseService = {
                 
                 if (hasAllKeywords) {
                     group.segments.forEach(seg => {
+                        // Build Context
+                        const prevLines: string[] = [];
+                        const nextLines: string[] = [];
+
+                        // Collect previous 6 lines (if they belong to same video)
+                        for (let i = 6; i >= 1; i--) {
+                            const n = neighborMap.get(seg.id - i);
+                            if (n && n.video_id === seg.video_id) {
+                                prevLines.push(n.text);
+                            }
+                        }
+                        
+                        // Collect next 6 lines (if they belong to same video)
+                        for (let i = 1; i <= 6; i++) {
+                            const n = neighborMap.get(seg.id + i);
+                            if (n && n.video_id === seg.video_id) {
+                                nextLines.push(n.text);
+                            }
+                        }
+
                         results.push({
                             video: {
                                 id: group.video.id,
@@ -433,7 +473,11 @@ const SupabaseService = {
                                 seconds: seg.seconds
                             },
                             isAiMatch: true,
-                            aiReasoning: `多词联动匹配: ${keywords.join(' + ')}`
+                            aiReasoning: `多词联动匹配: ${keywords.join(' + ')}`,
+                            context: {
+                                prev: prevLines.join(' '),
+                                next: nextLines.join(' ')
+                            }
                         });
                     });
                 }
@@ -732,16 +776,24 @@ const fallbackSearch = (query: string, localVideos: VideoData[]): SearchResult[]
       const hasAllKeywords = keywords.every(k => fullText.includes(k));
 
       if (hasAllKeywords) {
-          video.transcript.forEach(segment => {
+          video.transcript.forEach((segment, idx) => {
             const text = segment.text.toLowerCase();
             const matchesAny = keywords.some(k => text.includes(k));
 
             if (matchesAny) {
+              // Get context: Increased to 6 previous and 6 next segments
+              const prevSegments = video.transcript.slice(Math.max(0, idx - 6), idx);
+              const prev = prevSegments.map(s => s.text).join(' ');
+              
+              const nextSegments = video.transcript.slice(idx + 1, Math.min(video.transcript.length, idx + 7));
+              const next = nextSegments.map(s => s.text).join(' ');
+              
               results.push({
                 video,
                 segment,
                 isAiMatch: true,
-                aiReasoning: `全匹配视频中的片段 (包含: ${keywords.filter(k => text.includes(k)).join(', ')})`
+                aiReasoning: `全匹配视频中的片段 (包含: ${keywords.filter(k => text.includes(k)).join(', ')})`,
+                context: { prev, next }
               });
             }
           });
@@ -1220,7 +1272,7 @@ create policy "Enable access for all users" on app_users for all using (true) wi
           </button>
         </div>
 
-        <div className="flex border-b border-slate-700 bg-slate-900/50 no-scrollbar">
+        <div className="flex border-b border-slate-700 bg-slate-900/50 overflow-x-auto no-scrollbar">
           {['users', 'data', 'coze'].map(tab => (
               <button key={tab} onClick={() => setActiveTab(tab as any)}
                 className={`px-6 py-3 text-sm font-medium transition capitalize whitespace-nowrap ${activeTab === tab ? 'text-indigo-400 border-b-2 border-indigo-400 bg-slate-800' : 'text-slate-400 hover:text-white'}`}>
@@ -1585,9 +1637,10 @@ const App = () => {
       </header>
 
       <main className="flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 sm:py-6 overflow-hidden">
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 h-full">
+        {/* LAYOUT CHANGED: 1:1 RATIO (lg:grid-cols-2) */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 h-full">
           {/* 左侧搜索栏 - 在所有设备上可见，移动端自动占据全宽全高 */}
-          <div className="lg:col-span-1 flex flex-col h-full min-h-0 gap-4">
+          <div className="flex flex-col h-full min-h-0 gap-4">
             <div className="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg flex-shrink-0">
               <div className="flex justify-between items-center mb-4">
                   <h2 className="text-lg font-semibold text-white">内容搜索</h2>
@@ -1634,33 +1687,54 @@ const App = () => {
               )}
               {searchResults.map((result, idx) => (
                 <div key={idx} onClick={() => handleSearchResultClick(result)}
-                  className={`border p-4 rounded-lg cursor-pointer transition relative overflow-hidden flex-shrink-0 ${result.isAiMatch ? 'bg-indigo-900/10 border-indigo-500/30' : 'bg-slate-800/50 border-slate-700/50 hover:bg-slate-800'}`}>
-                  <div className="flex justify-between items-start mb-2">
-                    <span className="text-xs font-medium px-2 py-0.5 rounded text-indigo-400 bg-indigo-400/10">{result.segment.startTime}</span>
-                    <span className="text-slate-500"><HardDrive className="w-3 h-3" /></span>
-                  </div>
-                  <p className="text-slate-200 text-sm leading-relaxed mb-2">
-                    {result.isAiMatch && result.aiQuote ? (
-                      <span className="text-white font-medium italic">"{result.aiQuote}"</span>
-                    ) : (
-                      <span>"... <span className={!isAiSearch ? "text-white font-medium bg-indigo-600/20" : ""}>{result.segment.text}</span> ..."</span>
-                    )}
-                  </p>
+                  className={`border p-4 rounded-lg cursor-pointer transition relative overflow-hidden flex-shrink-0 flex flex-col gap-2 ${result.isAiMatch ? 'bg-indigo-900/10 border-indigo-500/30' : 'bg-slate-800/50 border-slate-700/50 hover:bg-slate-800'}`}>
                   
+                  {/* Result Header: Title and Time */}
+                  <div className="flex justify-between items-start">
+                    <div className="flex items-center gap-2 overflow-hidden mr-2">
+                        <FileVideo className="w-4 h-4 text-indigo-400 flex-shrink-0" />
+                        <span className="text-xs font-bold text-slate-300 truncate">{result.video.title}</span>
+                    </div>
+                    <div className="flex items-center gap-1 text-[10px] font-mono text-slate-500 bg-black/20 px-1.5 py-0.5 rounded flex-shrink-0">
+                        <Clock className="w-3 h-3" />
+                        <span>{result.segment.startTime}</span>
+                        {result.segment.endTime && <span>- {result.segment.endTime}</span>}
+                    </div>
+                  </div>
+
+                  {/* Result Body: Content Context */}
+                  <div className="text-sm leading-relaxed mt-2">
+                    {result.isAiMatch && result.aiQuote ? (
+                      <div className="text-white font-medium italic bg-indigo-500/10 p-2 rounded border-l-2 border-indigo-500">
+                         "{result.aiQuote}"
+                      </div>
+                    ) : (
+                      <div className="text-slate-400">
+                          {/* Inline context presentation */}
+                          {result.context?.prev && <span>{result.context.prev} </span>}
+                          <span className={`text-slate-100 font-medium ${isAiSearch ? 'bg-indigo-500/20 text-indigo-100' : 'bg-yellow-500/10 text-yellow-100'} px-1 rounded`}>
+                              {result.segment.text}
+                          </span>
+                          {result.context?.next && <span> {result.context.next}</span>}
+                      </div>
+                    )}
+                  </div>
+                  
+                  {/* Result Footer: AI Reasoning */}
                   {result.isAiMatch && result.aiReasoning && (
-                    <div className="mt-2 text-xs text-indigo-300 bg-indigo-500/10 p-2.5 rounded-lg border border-indigo-500/20 leading-relaxed">
-                       <span className="font-bold mr-1 opacity-75">AI 解析:</span> {result.aiReasoning}
+                    <div className="mt-1 text-xs text-indigo-300/80 flex items-start gap-1 pt-2 border-t border-slate-700/30">
+                       <Bot className="w-3 h-3 mt-0.5 flex-shrink-0" /> 
+                       <span>{result.aiReasoning}</span>
                     </div>
                   )}
-
-                  <p className="text-xs text-slate-500 truncate mt-2 border-t border-slate-700/50 pt-2">{result.video.title}</p>
                 </div>
               ))}
             </div>
           </div>
 
           {/* 右侧播放/字幕区域 - 在移动端隐藏 (hidden lg:flex) */}
-          <div className="hidden lg:flex lg:col-span-2 h-full min-h-0 flex-col">
+          {/* COL-SPAN CHANGED: lg:col-span-1 (was 2) */}
+          <div className="hidden lg:flex lg:col-span-1 h-full min-h-0 flex-col">
             <div className="bg-slate-900 rounded-xl overflow-hidden shadow-2xl border border-slate-800 flex flex-col h-full">
                 <div className="bg-black relative flex items-center justify-center border-b border-slate-800 flex-shrink-0 h-[40%] min-h-[200px]">
                   {selectedVideo && (selectedVideo.publicUrl || selectedVideo.dataUrl) ? (
