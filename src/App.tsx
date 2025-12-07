@@ -77,6 +77,25 @@ interface SearchResult {
   aiQuote?: string; // Added to support AI quote separation
 }
 
+// --- GLOBAL CONFIGURATION ---
+// ⚠️ 重要：为了让其他用户访问时能直接登录，请将你的 Supabase 配置填写在这里
+// 这样别人打开网页时，会自动使用这些配置，无需再次手动输入。
+const GLOBAL_APP_CONFIG: AppSettings = {
+  // Supabase 项目地址 (例如: https://xyz.supabase.co)
+  supabaseUrl: 'https://euikwoyohattxfxmrzgt.supabase.co', 
+  
+  // Supabase API Key (anon/public key)
+  supabaseKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImV1aWt3b3lvaGF0dHhmeG1yemd0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjQ4ODk4NjgsImV4cCI6MjA4MDQ2NTg2OH0.ygURWUh59iYrth-Or4zgNmDl_ygis1qmTkSLO7SpTZE',
+  
+  // Coze 配置 (可选，如果不填则无法使用 AI 搜索)
+  cozeApiKey: 'pat_vv2A48hplarHOQclQigwn4HZbZQWolKBIxnsJOhevP2R4gtzzfVOQ7R4pTJqXqmo',
+  cozeBotId: '7579927339174690822',
+  cozeBaseUrl: 'https://api.coze.cn',
+  
+  // 远程 JSON 地址 (可选)
+  remoteDatabaseUrl: '' 
+};
+
 // --- Mock Database (LocalStorage Wrapper) ---
 
 const DB_KEYS = {
@@ -88,33 +107,32 @@ const DB_KEYS = {
 
 const MockDB = {
   init: () => {
-    if (!localStorage.getItem(DB_KEYS.USERS)) {
-      const defaultAdmin: UserAccount = {
-        id: 'admin-1',
-        username: 'admin',
-        password: 'admin',
-        role: 'admin',
-        status: 'active',
-        note: 'Super Admin'
-      };
-      localStorage.setItem(DB_KEYS.USERS, JSON.stringify([defaultAdmin]));
-    }
-    
-    if (!localStorage.getItem(DB_KEYS.SETTINGS)) {
-      const defaultSettings: AppSettings = {
-        remoteDatabaseUrl: '',
-        cozeApiKey: '',
-        cozeBotId: '',
-        cozeBaseUrl: 'https://api.coze.cn',
-        supabaseUrl: '',
-        supabaseKey: ''
-      };
-      localStorage.setItem(DB_KEYS.SETTINGS, JSON.stringify(defaultSettings));
+    try {
+      if (!localStorage.getItem(DB_KEYS.USERS)) {
+        const defaultAdmin: UserAccount = {
+          id: 'admin-1',
+          username: 'admin',
+          password: 'admin',
+          role: 'admin',
+          status: 'active',
+          note: 'Super Admin'
+        };
+        localStorage.setItem(DB_KEYS.USERS, JSON.stringify([defaultAdmin]));
+      }
+      
+      // 注意：这里不再强制初始化 SETTINGS 为空对象，
+      // 而是依赖 getSettings 中的 GLOBAL_APP_CONFIG 回退机制
+    } catch (e) {
+      console.error("Local Storage Init Error:", e);
     }
   },
 
   getUsers: (): UserAccount[] => {
-    return JSON.parse(localStorage.getItem(DB_KEYS.USERS) || '[]');
+    try {
+      return JSON.parse(localStorage.getItem(DB_KEYS.USERS) || '[]');
+    } catch {
+      return [];
+    }
   },
 
   saveUser: (user: UserAccount) => {
@@ -141,24 +159,40 @@ const MockDB = {
   },
   
   getSettings: (): AppSettings => {
-    const defaults = { 
-        remoteDatabaseUrl: '', 
-        cozeApiKey: '', 
-        cozeBotId: '',
-        cozeBaseUrl: 'https://api.coze.cn',
-        supabaseUrl: '',
-        supabaseKey: ''
-    };
-    const stored = JSON.parse(localStorage.getItem(DB_KEYS.SETTINGS) || '{}');
-    return { ...defaults, ...stored };
+    try {
+        const storedStr = localStorage.getItem(DB_KEYS.SETTINGS);
+        const local = storedStr ? JSON.parse(storedStr) : {};
+        
+        // 核心逻辑：如果本地存储没有值，则使用代码中的全局配置 (GLOBAL_APP_CONFIG)
+        // 这样即使换了浏览器，只要代码里填了，就能自动连上数据库
+        return { 
+            remoteDatabaseUrl: local.remoteDatabaseUrl || GLOBAL_APP_CONFIG.remoteDatabaseUrl || '',
+            cozeApiKey: local.cozeApiKey || GLOBAL_APP_CONFIG.cozeApiKey || '',
+            cozeBotId: local.cozeBotId || GLOBAL_APP_CONFIG.cozeBotId || '',
+            cozeBaseUrl: local.cozeBaseUrl || GLOBAL_APP_CONFIG.cozeBaseUrl || 'https://api.coze.cn',
+            supabaseUrl: local.supabaseUrl || GLOBAL_APP_CONFIG.supabaseUrl || '',
+            supabaseKey: local.supabaseKey || GLOBAL_APP_CONFIG.supabaseKey || ''
+        };
+    } catch (e) {
+        console.error("Settings Load Error, using defaults:", e);
+        return GLOBAL_APP_CONFIG;
+    }
   },
   
   saveSettings: (settings: AppSettings) => {
-    localStorage.setItem(DB_KEYS.SETTINGS, JSON.stringify(settings));
+    try {
+        localStorage.setItem(DB_KEYS.SETTINGS, JSON.stringify(settings));
+    } catch (e) {
+        console.error("Failed to save settings:", e);
+    }
   },
   
   getLocalVideos: (): VideoData[] => {
-    return JSON.parse(localStorage.getItem(DB_KEYS.LOCAL_VIDEOS) || '[]');
+    try {
+        return JSON.parse(localStorage.getItem(DB_KEYS.LOCAL_VIDEOS) || '[]');
+    } catch {
+        return [];
+    }
   },
   
   saveLocalVideo: (video: VideoData) => {
@@ -172,8 +206,12 @@ const MockDB = {
   },
 
   getRememberedUser: () => {
-    const data = localStorage.getItem(DB_KEYS.AUTH_REMEMBER);
-    return data ? JSON.parse(data) : null;
+    try {
+        const data = localStorage.getItem(DB_KEYS.AUTH_REMEMBER);
+        return data ? JSON.parse(data) : null;
+    } catch {
+        return null;
+    }
   },
 
   saveRememberedUser: (username: string, password: string) => {
@@ -815,7 +853,7 @@ const AuthScreen = ({ onLogin }: { onLogin: (user: UserAccount) => void }) => {
 
   return (
     <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4">
-      <div className="bg-slate-800 p-8 rounded-xl shadow-2xl w-full max-w-md border border-slate-700">
+      <div className="bg-slate-800 p-6 sm:p-8 rounded-xl shadow-2xl w-full max-w-md border border-slate-700">
         <div className="flex justify-center mb-6">
           <div className="bg-indigo-500 p-3 rounded-full">
             <span className="text-white"><Lock className="w-8 h-8" /></span>
@@ -1182,10 +1220,10 @@ create policy "Enable access for all users" on app_users for all using (true) wi
           </button>
         </div>
 
-        <div className="flex border-b border-slate-700 bg-slate-900/50">
+        <div className="flex border-b border-slate-700 bg-slate-900/50 no-scrollbar">
           {['users', 'data', 'coze'].map(tab => (
               <button key={tab} onClick={() => setActiveTab(tab as any)}
-                className={`px-6 py-3 text-sm font-medium transition capitalize ${activeTab === tab ? 'text-indigo-400 border-b-2 border-indigo-400 bg-slate-800' : 'text-slate-400 hover:text-white'}`}>
+                className={`px-6 py-3 text-sm font-medium transition capitalize whitespace-nowrap ${activeTab === tab ? 'text-indigo-400 border-b-2 border-indigo-400 bg-slate-800' : 'text-slate-400 hover:text-white'}`}>
                 {tab === 'users' ? '用户管理' : tab === 'data' ? '数据库配置' : 'Coze AI'}
               </button>
           ))}
@@ -1546,8 +1584,9 @@ const App = () => {
         </div>
       </header>
 
-      <main className="flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 overflow-hidden">
+      <main className="flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 sm:py-6 overflow-hidden">
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 h-full">
+          {/* 左侧搜索栏 - 在所有设备上可见，移动端自动占据全宽全高 */}
           <div className="lg:col-span-1 flex flex-col h-full min-h-0 gap-4">
             <div className="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg flex-shrink-0">
               <div className="flex justify-between items-center mb-4">
@@ -1620,7 +1659,8 @@ const App = () => {
             </div>
           </div>
 
-          <div className="lg:col-span-2 h-full min-h-0 flex flex-col">
+          {/* 右侧播放/字幕区域 - 在移动端隐藏 (hidden lg:flex) */}
+          <div className="hidden lg:flex lg:col-span-2 h-full min-h-0 flex-col">
             <div className="bg-slate-900 rounded-xl overflow-hidden shadow-2xl border border-slate-800 flex flex-col h-full">
                 <div className="bg-black relative flex items-center justify-center border-b border-slate-800 flex-shrink-0 h-[40%] min-h-[200px]">
                   {selectedVideo && (selectedVideo.publicUrl || selectedVideo.dataUrl) ? (
